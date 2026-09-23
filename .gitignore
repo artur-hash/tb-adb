@@ -1,0 +1,4 @@
+# credenciais locais das TBs (SN/senhas) - nunca commitar
+devices.json
+__pycache__/
+*.pyc

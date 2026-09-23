@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+# tb-adb — lista TBs NovaStar (Taurus) e liga/desliga o ADB, sem ViPlex.
+# Fluxo: login REST (16674) -> habilita SSH (dropbear:1212) -> ssh root -> setprop adbd.
+import sys, os, json, ssl, socket, subprocess, urllib.request, time, argparse, tempfile
+
+CFG_DIR  = os.path.expanduser("~/.config/tb-adb")
+REG_FILE = os.path.join(CFG_DIR, "devices.json")
+API_PORT = 16674
+SSH_PORT = 1212
+DEF_USER = "admin"
+DEF_PASS = "123456"          # senha de login/SSH (confirmada na TB2)
+ADB_PORT = 5555
+SSH_OPTS = [
+    "-p", str(SSH_PORT),
+    "-o","StrictHostKeyChecking=no","-o","UserKnownHostsFile=/dev/null",
+    "-o","KexAlgorithms=diffie-hellman-group14-sha1",   # dropbear c/ ecdsa quebrado -> forcar
+    "-o","HostKeyAlgorithms=ssh-rsa","-o","Ciphers=aes128-ctr",
+    "-o","PubkeyAuthentication=no","-o","PreferredAuthentications=password",
+    "-o","NumberOfPasswordPrompts=1","-o","ConnectTimeout=8","-o","LogLevel=ERROR",
+]
+C = dict(g="\033[32m", r="\033[31m", y="\033[33m", b="\033[34m", d="\033[2m", n="\033[0m", bold="\033[1m")
+
+def load_reg():
+    try:
+        with open(REG_FILE) as f: return json.load(f)
+    except Exception: return {}
+def save_reg(reg):
+    os.makedirs(CFG_DIR, exist_ok=True)
+    with open(REG_FILE,"w") as f: json.dump(reg,f,indent=2)
+
+def tcp_open(ip, port, t=1.0):
+    s=socket.socket(); s.settimeout(t)
+    try: return s.connect_ex((ip,port))==0
+    finally: s.close()
+
+def _ctx():
+    c=ssl.create_default_context(); c.check_hostname=False; c.verify_mode=ssl.CERT_NONE; return c
+
+def api(ip, path, method, token=None, body=None, t=10):
+    url=f"https://{ip}:{API_PORT}/terminal/core/v1/{path}"
+    data=json.dumps(body).encode() if body is not None else None
+    req=urllib.request.Request(url, data=data, method=method)
+    req.add_header("Content-Type","application/json")
+    if token: req.add_header("Authorization", token)
+    with urllib.request.urlopen(req, context=_ctx(), timeout=t) as r:
+        return json.loads(r.read().decode())
+
+def login(ip, sn, pw=DEF_PASS):
+    r=api(ip,"login","POST",body={
+        "sn":sn,"username":DEF_USER,"password":pw,
+        "clientId":os.urandom(16).hex(),"clientName":"tb-adb","loginType":9,
+        "source":{"type":0,"platform":2,"platformVersion":"3.0.5"}})
+    if r.get("code")!=0: raise RuntimeError(r.get("message","login falhou"))
+    return r["data"]["token"]
+
+def _ssh_svc(ip, token, state):
+    r=api(ip,"ssh/service/status","POST",token=token,
+          body={"serviceStatus":[{"state":state,"type":"SSH","persisted":False}]})
+    if r.get("code")!=0: raise RuntimeError("ssh service: "+r.get("message",""))
+
+def enable_ssh(ip, token):
+    # Ciclo OFF->ON e ESSENCIAL: apos um reboot da TB o dropbear sobe num estado
+    # em que a auth por senha falha; so mandar state=1 nao reseta. Desligar (0) e
+    # religar (1) faz o dropbear reiniciar limpo e aceitar admin/123456.
+    try: _ssh_svc(ip, token, 0)
+    except Exception: pass
+    time.sleep(2)
+    _ssh_svc(ip, token, 1)
+    for _ in range(15):
+        if tcp_open(ip, SSH_PORT): return True
+        time.sleep(1)
+    raise RuntimeError("SSH nao subiu na 1212")
+
+def ssh_run(ip, cmd, pw=DEF_PASS):
+    ap=tempfile.NamedTemporaryFile("w",suffix=".sh",delete=False,dir=CFG_DIR)
+    ap.write('#!/bin/sh\necho "$TB_PW"\n'); ap.close(); os.chmod(ap.name,0o700)
+    env=dict(os.environ, TB_PW=pw, SSH_ASKPASS=ap.name, SSH_ASKPASS_REQUIRE="force", DISPLAY=os.environ.get("DISPLAY",":0"))
+    try:
+        p=subprocess.run(["setsid","-w","ssh",*SSH_OPTS,f"{DEF_USER}@{ip}",cmd],
+                         env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=25)
+        return p.returncode, p.stdout, p.stderr
+    finally:
+        try: os.unlink(ap.name)
+        except Exception: pass
+
+def get_sn_via_ssh(ip, pw=DEF_PASS):
+    rc,out,_=ssh_run(ip,"getprop ro.serialno 2>/dev/null || getprop ro.boot.serialno",pw)
+    return out.strip() if rc==0 and out.strip() else None
+
+# ---------- descoberta ----------
+def usb_gateways():
+    """IPs de gateway das interfaces (pega o gateway das rotas /24 diretas)."""
+    gws=set()
+    try:
+        out=subprocess.run(["ip","-o","-4","route","show"],capture_output=True,text=True).stdout
+        for line in out.splitlines():
+            parts=line.split()
+            if "default" in parts and "via" in parts:
+                gws.add(parts[parts.index("via")+1])
+    except Exception: pass
+    return gws
+
+def local_subnets():
+    nets=[]
+    try:
+        out=subprocess.run(["ip","-o","-4","addr","show"],capture_output=True,text=True).stdout
+        for line in out.splitlines():
+            if " scope global" in line and "/24" in line:
+                cidr=line.split()[3]; base=cidr.split("/")[0].rsplit(".",1)[0]
+                nets.append(base)
+    except Exception: pass
+    return nets
+
+def discover(deep=False):
+    """Acha TBs: gateways + (opcional) varredura /24, testando a porta 16674."""
+    reg=load_reg(); found={}
+    cands=set(usb_gateways()) | set(reg.keys())
+    if deep:
+        for base in local_subnets():
+            cands|={f"{base}.{i}" for i in range(1,255)}
+    from concurrent.futures import ThreadPoolExecutor
+    def chk(ip): return ip if tcp_open(ip,API_PORT,0.4) else None
+    with ThreadPoolExecutor(128) as ex:
+        for ip in ex.map(chk, cands):
+            if ip: found[ip]=reg.get(ip,{})
+    return found, reg
+
+# ---------- acoes ----------
+def ensure_device(ip, reg):
+    """Garante que temos SN+senha do device (cache, ou pergunta uma vez)."""
+    d=reg.get(ip,{})
+    if d.get("sn"): return d
+    print(f"{C['y']}TB em {ip} ainda nao cadastrada.{C['n']}")
+    sn=input("  SN da TB (etiqueta do aparelho): ").strip()
+    pw=input(f"  senha [{DEF_PASS}]: ").strip() or DEF_PASS
+    # validar
+    try:
+        login(ip, sn, pw); print(f"  {C['g']}ok, credenciais validas{C['n']}")
+    except Exception as e:
+        print(f"  {C['r']}nao validou: {e}{C['n']}"); 
+    d={"sn":sn,"password":pw,"name":d.get("name","")}
+    reg[ip]=d; save_reg(reg); return d
+
+def adb_status(ip):
+    return "ligado" if tcp_open(ip,ADB_PORT,0.6) else "desligado"
+
+def find_ssh_pw(ip, reg, login_pw):
+    # A senha do SSH pode diferir da de conexao: nos players rk356x/rk3328 (ex.: T40,
+    # Android 11) o dropbear usa a fixa "novastar2008"; nos rk312x (ex.: T2) usa a de
+    # conexao. Tenta na ordem e memoriza a que funciona.
+    d=reg.get(ip,{}); cands=[]
+    if d.get("ssh_password"): cands.append(d["ssh_password"])
+    cands += [login_pw, "novastar2008", DEF_PASS]
+    seen=set()
+    for p in cands:
+        if not p or p in seen: continue
+        seen.add(p)
+        rc,out,_=ssh_run(ip,"echo OK", p)
+        if rc==0 and "OK" in out:
+            if d.get("ssh_password")!=p: d["ssh_password"]=p; reg[ip]=d; save_reg(reg)
+            return p
+    raise RuntimeError("nenhuma senha SSH funcionou (tentei: %s)"%", ".join(seen))
+
+def adb_set(ip, reg, on=True):
+    d=ensure_device(ip,reg); login_pw=d.get("password",DEF_PASS)
+    print(f"  login em {ip}...", flush=True)
+    tok=login(ip, d["sn"], login_pw)
+    print("  habilitando SSH...", flush=True); enable_ssh(ip,tok)
+    sshpw=find_ssh_pw(ip, reg, login_pw)
+    if on:
+        # sys.adbd.enable=1: portao da NovaStar no Android 11 (sem isso o adbd fecha
+        # toda conexao com CLSE). Inofensivo em players que nao tem o portao.
+        cmd=(f"setprop service.adb.tcp.port {ADB_PORT}; setprop persist.adb.tcp.port {ADB_PORT}; "
+             f"setprop sys.adbd.enable 1; stop adbd; start adbd; echo done")
+    else:
+        cmd="setprop service.adb.tcp.port -1; setprop sys.adbd.enable 0; stop adbd; start adbd; echo done"
+    print(f"  {'ligando' if on else 'desligando'} adb...", flush=True)
+    rc,out,err=ssh_run(ip, cmd, sshpw)
+    if rc!=0: raise RuntimeError(err.strip() or "ssh falhou")
+    if on:
+        for _ in range(8):
+            if tcp_open(ip,ADB_PORT): break
+            time.sleep(1)
+    return adb_status(ip)
+
+def do_connect(ip):
+    if subprocess.run(["which","adb"],capture_output=True).returncode!=0:
+        print(f"  {C['y']}adb nao instalado (sudo pacman -S android-tools){C['n']}"); return
+    subprocess.run(["adb","connect",f"{ip}:{ADB_PORT}"])
+
+# ---------- UI ----------
+def fmt_list(found, reg):
+    rows=[]
+    for ip,d in sorted(found.items()):
+        name=reg.get(ip,{}).get("name") or "(sem nome)"
+        sn=reg.get(ip,{}).get("sn") or "?"
+        st=adb_status(ip); col=C['g'] if st=="ligado" else C['d']
+        rows.append((ip,name,sn,st,col))
+    return rows
+
+def cmd_list(deep=False):
+    print(f"{C['d']}procurando TBs...{C['n']}")
+    found,reg=discover(deep)
+    if not found:
+        print(f"{C['y']}nenhuma TB encontrada. (tente: tb-adb list --deep){C['n']}"); return found,reg
+    print(f"\n{C['bold']}{'IP':<16}{'NOME':<20}{'SN':<22}ADB{C['n']}")
+    for ip,name,sn,st,col in fmt_list(found,reg):
+        print(f"{col}{ip:<16}{name:<20}{sn:<22}{st}{C['n']}")
+    print()
+    return found,reg
+
+def menu():
+    while True:
+        found,reg=cmd_list()
+        ips=sorted(found.keys())
+        print(f"{C['bold']}acoes:{C['n']} [numero]=alternar adb  c=conectar adb  r=rescan  d=rescan profundo  q=sair")
+        for i,ip in enumerate(ips): print(f"  {i+1}) {ip}")
+        ch=input("> ").strip().lower()
+        if ch=="q": break
+        if ch=="r": continue
+        if ch=="d": cmd_list(deep=True); input("enter..."); continue
+        if ch=="c":
+            for ip in ips: do_connect(ip)
+            input("enter..."); continue
+        if ch.isdigit() and 1<=int(ch)<=len(ips):
+            ip=ips[int(ch)-1]; cur=adb_status(ip)
+            try:
+                new=adb_set(ip,reg,on=(cur!="ligado"))
+                print(f"  {C['g']}adb agora: {new}{C['n']}")
+                if new=="ligado": do_connect(ip)
+            except Exception as e:
+                print(f"  {C['r']}erro: {e}{C['n']}")
+            input("enter...")
+
+def main():
+    ap=argparse.ArgumentParser(prog="tb-adb", description="Lista TBs NovaStar e liga/desliga ADB (sem ViPlex)")
+    sub=ap.add_subparsers(dest="cmd")
+    sub.add_parser("list").add_argument("--deep",action="store_true")
+    for name in ("on","off"):
+        sp=sub.add_parser(name); sp.add_argument("ip")
+    sp=sub.add_parser("shell"); sp.add_argument("ip"); sp.add_argument("command",nargs="?",default="sh")
+    sub.add_parser("menu")
+    a=ap.parse_args()
+    if a.cmd in (None,"menu"): menu(); return
+    if a.cmd=="list": cmd_list(a.deep); return
+    reg=load_reg()
+    if a.cmd in ("on","off"):
+        st=adb_set(a.ip,reg,on=(a.cmd=="on")); print(f"adb: {st}")
+        if a.cmd=="on": do_connect(a.ip)
+    elif a.cmd=="shell":
+        d=ensure_device(a.ip,reg); tok=login(a.ip,d["sn"],d["password"]); enable_ssh(a.ip,tok)
+        os.execvpe("ssh", ["ssh",*SSH_OPTS,f"{DEF_USER}@{a.ip}",a.command],
+                   dict(os.environ)) if a.command!="sh" else \
+        subprocess.run(["setsid","-w","ssh",*SSH_OPTS,f"{DEF_USER}@{a.ip}"],
+                       env=dict(os.environ,TB_PW=d["password"]))
+
+if __name__=="__main__":
+    try: main()
+    except KeyboardInterrupt: print()
