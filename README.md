@@ -96,4 +96,16 @@ Com a TB ligada por USB, ela aparece como gateway da interface USB (normalmente 
 ## Testado
 
 - Linux (Arch) + TB T2-4G (rk312x): `list`, `on`, `off`, `shell` (interativo e com comando) usando o ssh do sistema; `on` e `off` usando paramiko 3.5.1 (o backend do Windows).
-- macOS e Windows: a descoberta de rede foi testada com saídas de exemplo de `netstat`/`ifconfig` e `route print` (inclusive Windows em português). Ainda falta rodar numa máquina macOS/Windows de verdade.
+- macOS e Windows: a descoberta de rede foi testada com saídas de exemplo de `netstat`/`ifconfig` e `route print` (inclusive Windows em português). Ainda falta rodar numa máquina macOS/Windows de verdade — se você testar, conte numa issue.
+
+## Contribuindo
+
+Issues e pull requests são bem-vindos — veja o [CONTRIBUTING.md](CONTRIBUTING.md). Relatos de teste em outros modelos de TB e no macOS/Windows ajudam muito.
+
+## Aviso
+
+Projeto independente, sem vínculo com a NovaStar. Use apenas em players que você administra. As senhas no código são os padrões de fábrica dos players; se as suas TBs usam outras, o script pergunta e guarda localmente.
+
+## Licença
+
+[MIT](LICENSE)
