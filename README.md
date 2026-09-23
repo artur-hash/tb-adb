@@ -1,32 +1,47 @@
 # tb-adb
 
-Lista players NovaStar Taurus (TBs) na rede e liga/desliga o ADB via Wi-Fi/LAN — sem precisar do ViPlex e sem cabo.
+Lista players NovaStar Taurus (TBs) na rede e liga/desliga o ADB via Wi-Fi/LAN — sem precisar do ViPlex e sem cabo. Funciona no Linux, macOS e Windows.
 
 ## Como funciona
 
 ```
-login REST (https :16674) -> liga o SSH (dropbear :1212) -> ssh root -> setprop adbd -> adb connect :5555
+login REST (https :16674) -> liga o SSH (dropbear :1212) -> ssh -> setprop adbd -> adb connect :5555
 ```
 
-1. Faz login na API do player (`/terminal/core/v1/login`) com o SN e a senha da TB.
+1. Faz login na API do player (`/terminal/core/v1/login`) com o SN e a senha da TB. Se o serviço da TB ainda estiver subindo (logo depois de ligar/reiniciar), espera até 120 s.
 2. Pela API, desliga e religa o serviço SSH (o ciclo OFF→ON é necessário depois de um reboot).
 3. Entra via SSH e liga o `adbd` em TCP na porta 5555.
 4. Roda `adb connect <ip>:5555`.
 
 ## Requisitos
 
-- Linux (veja [Limitações](#limitações))
-- Python 3 (só biblioteca padrão, sem `pip install`)
-- Cliente OpenSSH (`ssh`)
-- `adb` (`sudo pacman -S android-tools` / `sudo apt install adb`)
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| Python 3 | ✅ | ✅ | ✅ ([python.org](https://www.python.org/downloads/)) |
+| SSH | cliente OpenSSH (`ssh`) | já vem no sistema | `pip install "paramiko<4"` |
+| `adb` | `sudo pacman -S android-tools` / `sudo apt install adb` | `brew install android-platform-tools` | `winget install Google.PlatformTools` |
+
+No Linux/macOS o script usa só a biblioteca padrão do Python — sem `pip install`.
+
+> **Por que `paramiko<4` no Windows?** O dropbear das TBs só aceita host key `ssh-rsa` (SHA-1) — a `ecdsa` dele está quebrada. O paramiko 4+ removeu o `ssh-rsa`.
 
 ## Instalação
 
+**Linux / macOS**
+
 ```sh
-git clone https://github.com/artur-hash/tb-adb.git
-cd tb-adb
-ln -s "$PWD/tb-adb" ~/.local/bin/tb-adb   # ~/.local/bin precisa estar no PATH
+git clone https://github.com/artur-hash/tb-adb.git ~/code/tb-adb
+ln -s ~/code/tb-adb/tb-adb ~/.local/bin/tb-adb   # ~/.local/bin precisa estar no PATH
 ```
+
+**Windows**
+
+```bat
+git clone https://github.com/artur-hash/tb-adb.git %USERPROFILE%\tb-adb
+pip install "paramiko<4"
+```
+
+Depois coloque a pasta `%USERPROFILE%\tb-adb` no PATH — o `tb-adb.cmd` permite rodar `tb-adb ...` direto no terminal. Sem mexer no PATH: `python tb-adb on 192.168.3.52` de dentro da pasta.
 
 ## Uso
 
@@ -37,11 +52,16 @@ tb-adb list --deep          # varre as sub-redes /24 locais procurando a porta 1
 tb-adb on  192.168.3.52     # liga o ADB e conecta
 tb-adb off 192.168.3.52     # desliga o ADB
 tb-adb shell 192.168.3.52   # shell SSH na TB
+tb-adb shell 192.168.3.52 "getprop ro.product.model"   # roda um comando
 ```
+
+`on`, `off` e `shell` aceitam `--wait S` (segundos esperando o serviço da TB subir; padrão 120).
 
 Na primeira vez que usar um IP, o script pede o **SN** (etiqueta do aparelho) e a **senha** de conexão (padrão `123456`) e salva em `~/.config/tb-adb/devices.json`.
 
 > Esse arquivo guarda SNs e senhas das suas TBs — ele fica fora do repositório e não deve ser compartilhado.
+
+No Windows, o `shell` interativo usa o `ssh.exe` do sistema e mostra a senha para você digitar.
 
 ### Senhas SSH
 
@@ -52,23 +72,28 @@ A senha do SSH pode ser diferente da de conexão. O script tenta, em ordem, e me
 - `novastar2008` (fixa nos players rk356x/rk3328, ex.: T40 com Android 11)
 - `123456`
 
+### Variáveis de ambiente
+
+| Variável | Para quê |
+|---|---|
+| `TB_ADB_DEBUG=1` | mostra o traceback completo em vez da mensagem curta de erro |
+| `TB_ADB_SSH=openssh` / `paramiko` | força o backend de SSH (ex.: testar o caminho do Windows no Linux) |
+
 ## Problemas comuns
 
-**`ConnectionRefusedError` / `Connection refused` logo no login**
-O serviço da TB na porta 16674 ainda não subiu — normal logo depois de ligar/reiniciar a TB. Espere 1–2 minutos e tente de novo. Não é preciso cabo se a TB responde ao ping.
+**`servico da TB ainda nao respondeu (... Connection refused)`**
+O serviço da TB na porta 16674 ainda não subiu — normal logo depois de ligar/reiniciar a TB. O script espera sozinho até 120 s. Se estourar o tempo, confira se a TB está ligada e na mesma rede (`ping <ip>`). Não é preciso cabo se a TB responde ao ping.
 
-**`The handshake operation timed out` / `Connection reset by peer`**
-Mesma causa: o serviço está no meio da inicialização.
+**`sn not match`**
+SN errado para aquele IP. Corrija em `~/.config/tb-adb/devices.json` (ou apague a entrada para o script perguntar de novo).
+
+**`paramiko X nao suporta ssh-rsa`**
+Instale uma versão compatível: `pip install "paramiko<4"`.
 
 **Via cabo USB**
 Com a TB ligada por USB, ela aparece como gateway da interface USB (normalmente `192.168.42.129`) e o `tb-adb list` encontra sozinho.
 
-## Limitações
+## Testado
 
-Hoje funciona só no Linux:
-
-- `ssh_run` usa `setsid -w` e um helper `#!/bin/sh` como `SSH_ASKPASS` — não existe no macOS nem no Windows.
-- A descoberta usa `ip route` / `ip addr`; fora do Linux, o `list` só mostra IPs já cadastrados.
-- `do_connect` usa `which adb`.
-
-No Windows, dá para usar pelo **WSL**.
+- Linux (Arch) + TB T2-4G (rk312x): `list`, `on`, `off`, `shell` (interativo e com comando) usando o ssh do sistema; `on` e `off` usando paramiko 3.5.1 (o backend do Windows).
+- macOS e Windows: a descoberta de rede foi testada com saídas de exemplo de `netstat`/`ifconfig` e `route print` (inclusive Windows em português). Ainda falta rodar numa máquina macOS/Windows de verdade.

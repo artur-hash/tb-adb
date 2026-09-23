@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 # tb-adb — lista TBs NovaStar (Taurus) e liga/desliga o ADB, sem ViPlex.
 # Fluxo: login REST (16674) -> habilita SSH (dropbear:1212) -> ssh root -> setprop adbd.
-import sys, os, json, ssl, socket, subprocess, urllib.request, time, argparse, tempfile
+# Linux/macOS: usa o ssh do sistema. Windows: usa paramiko<4 (pip install "paramiko<4").
+import sys, os, re, json, ssl, socket, shutil, subprocess, urllib.request, urllib.error, http.client
+import time, argparse, tempfile, contextlib
 
 CFG_DIR  = os.path.expanduser("~/.config/tb-adb")
 REG_FILE = os.path.join(CFG_DIR, "devices.json")
 API_PORT = 16674
+API_WAIT = 120               # s esperando o servico da TB subir (logo apos o boot ele recusa/derruba conexoes)
 SSH_PORT = 1212
 DEF_USER = "admin"
 DEF_PASS = "123456"          # senha de login/SSH (confirmada na TB2)
 ADB_PORT = 5555
 SSH_OPTS = [
     "-p", str(SSH_PORT),
-    "-o","StrictHostKeyChecking=no","-o","UserKnownHostsFile=/dev/null",
+    "-o","StrictHostKeyChecking=no","-o",f"UserKnownHostsFile={os.devnull}",
     "-o","KexAlgorithms=diffie-hellman-group14-sha1",   # dropbear c/ ecdsa quebrado -> forcar
     "-o","HostKeyAlgorithms=ssh-rsa","-o","Ciphers=aes128-ctr",
     "-o","PubkeyAuthentication=no","-o","PreferredAuthentications=password",
     "-o","NumberOfPasswordPrompts=1","-o","ConnectTimeout=8","-o","LogLevel=ERROR",
 ]
 C = dict(g="\033[32m", r="\033[31m", y="\033[33m", b="\033[34m", d="\033[2m", n="\033[0m", bold="\033[1m")
+if os.name=="nt": os.system("")   # liga as cores ANSI no console do Windows
 
 def load_reg():
     try:
@@ -53,6 +57,27 @@ def login(ip, sn, pw=DEF_PASS):
     if r.get("code")!=0: raise RuntimeError(r.get("message","login falhou"))
     return r["data"]["token"]
 
+def login_wait(ip, sn, pw=DEF_PASS, wait=API_WAIT):
+    # Logo apos a TB ligar/reiniciar, a 16674 passa 1-2 min recusando conexao, aceitando
+    # e travando o TLS, ou resetando. So erro de rede e repetido; senha/SN errado falha na hora.
+    t0=time.time(); avisou=False
+    while True:
+        try:
+            tok=login(ip, sn, pw)
+            if avisou: print(f"  servico no ar ({int(time.time()-t0)}s)", flush=True)
+            return tok
+        except urllib.error.HTTPError: raise
+        except (OSError, http.client.HTTPException) as e:
+            motivo=getattr(e,"reason",e)
+            if time.time()-t0 >= wait:
+                raise RuntimeError(f"servico da TB em {ip}:{API_PORT} nao respondeu em {wait}s ({motivo}). "
+                                   "A TB esta ligada e na mesma rede?") from None
+            if not avisou:
+                print(f"  {C['y']}servico da TB ainda nao respondeu ({motivo}); "
+                      f"aguardando ate {wait}s (Ctrl+C cancela)...{C['n']}", flush=True)
+                avisou=True
+            time.sleep(3)
+
 def _ssh_svc(ip, token, state):
     r=api(ip,"ssh/service/status","POST",token=token,
           body={"serviceStatus":[{"state":state,"type":"SSH","persisted":False}]})
@@ -71,52 +96,116 @@ def enable_ssh(ip, token):
         time.sleep(1)
     raise RuntimeError("SSH nao subiu na 1212")
 
-def ssh_run(ip, cmd, pw=DEF_PASS):
+# ---------- ssh ----------
+def _ssh_backend():
+    # TB_ADB_SSH=openssh|paramiko forca um dos dois (util p/ testar o caminho do Windows no Linux)
+    b=os.environ.get("TB_ADB_SSH")
+    if b: return b
+    return "openssh" if os.name!="nt" and shutil.which("ssh") else "paramiko"
+
+@contextlib.contextmanager
+def _askpass_env(pw):
+    # ssh do sistema le a senha deste helper (SSH_ASKPASS), sem precisar de sshpass
+    os.makedirs(CFG_DIR, exist_ok=True)
     ap=tempfile.NamedTemporaryFile("w",suffix=".sh",delete=False,dir=CFG_DIR)
     ap.write('#!/bin/sh\necho "$TB_PW"\n'); ap.close(); os.chmod(ap.name,0o700)
-    env=dict(os.environ, TB_PW=pw, SSH_ASKPASS=ap.name, SSH_ASKPASS_REQUIRE="force", DISPLAY=os.environ.get("DISPLAY",":0"))
-    try:
-        p=subprocess.run(["setsid","-w","ssh",*SSH_OPTS,f"{DEF_USER}@{ip}",cmd],
-                         env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=25)
-        return p.returncode, p.stdout, p.stderr
+    try: yield dict(os.environ, TB_PW=pw, SSH_ASKPASS=ap.name, SSH_ASKPASS_REQUIRE="force", DISPLAY=os.environ.get("DISPLAY",":0"))
     finally:
         try: os.unlink(ap.name)
         except Exception: pass
+
+def _ssh_run_openssh(ip, cmd, pw):
+    with _askpass_env(pw) as env:
+        # start_new_session (= setsid): sem tty de controle o ssh nunca pede senha no terminal
+        p=subprocess.run(["ssh",*SSH_OPTS,f"{DEF_USER}@{ip}",cmd], env=env, stdin=subprocess.DEVNULL,
+                         capture_output=True, text=True, timeout=25, start_new_session=True)
+        return p.returncode, p.stdout, p.stderr
+
+def _ssh_run_paramiko(ip, cmd, pw):
+    import warnings
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")   # cryptography avisa sobre algoritmos antigos
+            import paramiko
+    except ImportError:
+        raise RuntimeError('sem o ssh do sistema, o tb-adb precisa do paramiko: pip install "paramiko<4"') from None
+    # paramiko>=4 removeu ssh-rsa (SHA-1), a unica host key que funciona no dropbear da TB
+    if "ssh-rsa" not in getattr(paramiko.Transport,"_key_info",{}):
+        raise RuntimeError(f'paramiko {paramiko.__version__} nao suporta ssh-rsa, exigido pela TB: pip install "paramiko<4"')
+    t=paramiko.Transport(socket.create_connection((ip,SSH_PORT),timeout=8))
+    try:
+        o=t.get_security_options()   # mesmos algoritmos forcados em SSH_OPTS
+        o.kex=("diffie-hellman-group14-sha1",); o.key_types=("ssh-rsa",); o.ciphers=("aes128-ctr",)
+        t.start_client(timeout=10)
+        try: t.auth_password(DEF_USER, pw)
+        except paramiko.AuthenticationException as e: return 255, "", f"auth falhou: {e}"
+        ch=t.open_session(timeout=10); ch.settimeout(25); ch.exec_command(cmd)
+        out=ch.makefile("rb").read().decode(errors="replace")
+        err=ch.makefile_stderr("rb").read().decode(errors="replace")
+        return ch.recv_exit_status(), out, err
+    finally: t.close()
+
+def ssh_run(ip, cmd, pw=DEF_PASS):
+    return (_ssh_run_paramiko if _ssh_backend()=="paramiko" else _ssh_run_openssh)(ip, cmd, pw)
+
+def ssh_interactive(ip, pw, cmd=None):
+    if not shutil.which("ssh"):
+        if cmd is None: raise RuntimeError("shell interativo precisa do cliente OpenSSH (ssh) instalado")
+        rc,out,err=ssh_run(ip,cmd,pw); sys.stdout.write(out); sys.stderr.write(err); return rc
+    args=["ssh","-t" if sys.stdin.isatty() else "-T",*SSH_OPTS,f"{DEF_USER}@{ip}"]+([cmd] if cmd else [])
+    if os.name=="nt":
+        # no Windows o ssh.exe nao tem SSH_ASKPASS confiavel: a senha e digitada
+        print(f"  senha SSH: {pw}")
+        return subprocess.run(args).returncode
+    with _askpass_env(pw) as env: return subprocess.run(args, env=env).returncode
 
 def get_sn_via_ssh(ip, pw=DEF_PASS):
     rc,out,_=ssh_run(ip,"getprop ro.serialno 2>/dev/null || getprop ro.boot.serialno",pw)
     return out.strip() if rc==0 and out.strip() else None
 
 # ---------- descoberta ----------
-def usb_gateways():
-    """IPs de gateway das interfaces (pega o gateway das rotas /24 diretas)."""
-    gws=set()
-    try:
-        out=subprocess.run(["ip","-o","-4","route","show"],capture_output=True,text=True).stdout
-        for line in out.splitlines():
-            parts=line.split()
-            if "default" in parts and "via" in parts:
-                gws.add(parts[parts.index("via")+1])
-    except Exception: pass
-    return gws
+IPV4=re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
 
-def local_subnets():
-    nets=[]
-    try:
-        out=subprocess.run(["ip","-o","-4","addr","show"],capture_output=True,text=True).stdout
-        for line in out.splitlines():
-            if " scope global" in line and "/24" in line:
-                cidr=line.split()[3]; base=cidr.split("/")[0].rsplit(".",1)[0]
-                nets.append(base)
-    except Exception: pass
-    return nets
+def _out(cmd):
+    try: return subprocess.run(cmd,capture_output=True,timeout=5).stdout.decode(errors="replace")
+    except Exception: return ""
+
+# Cada _net_* devolve (gateways padrao, bases das redes /24 locais), a partir da saida dos
+# comandos de rede do SO. A TB ligada por USB vira o gateway da interface USB (192.168.42.129).
+def _net_linux(routes, addrs):
+    gws={p[p.index("via")+1] for p in map(str.split,routes.splitlines()) if "default" in p and "via" in p}
+    bases=[l.split()[3].split("/")[0].rsplit(".",1)[0] for l in addrs.splitlines()
+           if " scope global" in l and "/24" in l]
+    return gws, bases
+
+def _net_mac(routes, ifconfig):
+    gws={p[1] for p in map(str.split,routes.splitlines()) if len(p)>1 and p[0]=="default" and IPV4.fullmatch(p[1])}
+    bases=[p[1].rsplit(".",1)[0] for p in map(str.split,ifconfig.splitlines())
+           if len(p)>3 and p[0]=="inet" and p[2]=="netmask" and p[3]=="0xffffff00"]
+    return gws, bases
+
+def _net_win(routes):
+    # 'route print -4': so os IPs de cada linha importam ('On-link'/'No vinculo' mudam com o idioma)
+    gws,bases=set(),[]
+    for l in routes.splitlines():
+        ips=IPV4.findall(l)
+        if len(ips)>=3 and ips[0]==ips[1]=="0.0.0.0": gws.add(ips[2])
+        elif len(ips)==3 and ips[1]=="255.255.255.0" and not ips[2].startswith(("127.","169.254.")):
+            bases.append(ips[2].rsplit(".",1)[0])
+    return gws, bases
+
+def net_info():
+    if sys.platform=="darwin": return _net_mac(_out(["netstat","-rn","-f","inet"]), _out(["ifconfig"]))
+    if os.name=="nt": return _net_win(_out(["route","print","-4"]))
+    return _net_linux(_out(["ip","-o","-4","route","show"]), _out(["ip","-o","-4","addr","show"]))
 
 def discover(deep=False):
     """Acha TBs: gateways + (opcional) varredura /24, testando a porta 16674."""
     reg=load_reg(); found={}
-    cands=set(usb_gateways()) | set(reg.keys())
+    gws,bases=net_info()
+    cands=set(gws) | set(reg.keys())
     if deep:
-        for base in local_subnets():
+        for base in bases:
             cands|={f"{base}.{i}" for i in range(1,255)}
     from concurrent.futures import ThreadPoolExecutor
     def chk(ip): return ip if tcp_open(ip,API_PORT,0.4) else None
@@ -135,9 +224,9 @@ def ensure_device(ip, reg):
     pw=input(f"  senha [{DEF_PASS}]: ").strip() or DEF_PASS
     # validar
     try:
-        login(ip, sn, pw); print(f"  {C['g']}ok, credenciais validas{C['n']}")
+        login_wait(ip, sn, pw); print(f"  {C['g']}ok, credenciais validas{C['n']}")
     except Exception as e:
-        print(f"  {C['r']}nao validou: {e}{C['n']}"); 
+        print(f"  {C['r']}nao validou: {e}{C['n']}");
     d={"sn":sn,"password":pw,"name":d.get("name","")}
     reg[ip]=d; save_reg(reg); return d
 
@@ -161,10 +250,10 @@ def find_ssh_pw(ip, reg, login_pw):
             return p
     raise RuntimeError("nenhuma senha SSH funcionou (tentei: %s)"%", ".join(seen))
 
-def adb_set(ip, reg, on=True):
+def adb_set(ip, reg, on=True, wait=API_WAIT):
     d=ensure_device(ip,reg); login_pw=d.get("password",DEF_PASS)
     print(f"  login em {ip}...", flush=True)
-    tok=login(ip, d["sn"], login_pw)
+    tok=login_wait(ip, d["sn"], login_pw, wait)
     print("  habilitando SSH...", flush=True); enable_ssh(ip,tok)
     sshpw=find_ssh_pw(ip, reg, login_pw)
     if on:
@@ -184,8 +273,10 @@ def adb_set(ip, reg, on=True):
     return adb_status(ip)
 
 def do_connect(ip):
-    if subprocess.run(["which","adb"],capture_output=True).returncode!=0:
-        print(f"  {C['y']}adb nao instalado (sudo pacman -S android-tools){C['n']}"); return
+    if not shutil.which("adb"):
+        print(f"  {C['y']}adb nao encontrado no PATH (instale o Android platform-tools){C['n']}"); return
+    # descarta a conexao velha: depois de religar o adbd o "already connected" fica offline por uns segundos
+    subprocess.run(["adb","disconnect",f"{ip}:{ADB_PORT}"],capture_output=True)
     subprocess.run(["adb","connect",f"{ip}:{ADB_PORT}"])
 
 # ---------- UI ----------
@@ -236,24 +327,28 @@ def main():
     ap=argparse.ArgumentParser(prog="tb-adb", description="Lista TBs NovaStar e liga/desliga ADB (sem ViPlex)")
     sub=ap.add_subparsers(dest="cmd")
     sub.add_parser("list").add_argument("--deep",action="store_true")
-    for name in ("on","off"):
+    for name in ("on","off","shell"):
         sp=sub.add_parser(name); sp.add_argument("ip")
-    sp=sub.add_parser("shell"); sp.add_argument("ip"); sp.add_argument("command",nargs="?",default="sh")
+        sp.add_argument("--wait",type=int,default=API_WAIT,metavar="S",
+                        help=f"segundos esperando o servico da TB subir (padrao {API_WAIT})")
+        if name=="shell": sp.add_argument("command",nargs="?",default="sh")
     sub.add_parser("menu")
     a=ap.parse_args()
     if a.cmd in (None,"menu"): menu(); return
     if a.cmd=="list": cmd_list(a.deep); return
     reg=load_reg()
     if a.cmd in ("on","off"):
-        st=adb_set(a.ip,reg,on=(a.cmd=="on")); print(f"adb: {st}")
+        st=adb_set(a.ip,reg,on=(a.cmd=="on"),wait=a.wait); print(f"adb: {st}")
         if a.cmd=="on": do_connect(a.ip)
     elif a.cmd=="shell":
-        d=ensure_device(a.ip,reg); tok=login(a.ip,d["sn"],d["password"]); enable_ssh(a.ip,tok)
-        os.execvpe("ssh", ["ssh",*SSH_OPTS,f"{DEF_USER}@{a.ip}",a.command],
-                   dict(os.environ)) if a.command!="sh" else \
-        subprocess.run(["setsid","-w","ssh",*SSH_OPTS,f"{DEF_USER}@{a.ip}"],
-                       env=dict(os.environ,TB_PW=d["password"]))
+        d=ensure_device(a.ip,reg); login_pw=d.get("password",DEF_PASS)
+        tok=login_wait(a.ip,d["sn"],login_pw,a.wait); enable_ssh(a.ip,tok)
+        pw=find_ssh_pw(a.ip,reg,login_pw)
+        sys.exit(ssh_interactive(a.ip, pw, None if a.command=="sh" else a.command))
 
 if __name__=="__main__":
     try: main()
     except KeyboardInterrupt: print()
+    except Exception as e:
+        if os.environ.get("TB_ADB_DEBUG"): raise   # TB_ADB_DEBUG=1 mostra o traceback completo
+        print(f"{C['r']}erro: {e}{C['n']}", file=sys.stderr); sys.exit(1)
