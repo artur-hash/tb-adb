@@ -90,6 +90,9 @@ A senha do SSH pode ser diferente da de conexão. O script tenta, em ordem, e me
 **`servico da TB ainda nao respondeu (... Connection refused)`**
 O serviço da TB na porta 16674 ainda não subiu — normal logo depois de ligar/reiniciar a TB. O script espera sozinho até 120 s. Se estourar o tempo, confira se a TB está ligada e na mesma rede (`ping <ip>`). Não é preciso cabo se a TB responde ao ping.
 
+**`TB em <ip> nao respondeu a busca`**
+Logo após reiniciar, a TB pode demorar um pouco para responder à busca UDP. Se o cadastro já tiver essa TB com esse IP como último conhecido, o script usa o SN dela automaticamente (sem perguntar); só pede os dados se não achar (ou achar mais de uma) correspondência.
+
 **`sn not match` / `credenciais invalidas para <ip>`**
 A TB recusou o SN/senha. Isso normalmente se resolve sozinho: o script já tenta a senha salva e depois a padrão (`123456`) antes de perguntar. Se aparecer esse erro é porque a senha digitada na hora também foi recusada — confira a etiqueta da TB e tente de novo, ou corrija/apague a entrada em `~/.config/tb-adb/devices.json` (chave = SN).
 

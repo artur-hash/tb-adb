@@ -72,6 +72,12 @@ def save_reg(reg):
             shutil.copyfile(REG_FILE, bak)
     with open(REG_FILE,"w") as f: json.dump(reg,f,indent=2)
 
+def sn_by_last_ip(reg, ip):
+    """Acha o SN cadastrado cujo last_ip bate com ip (funcao pura). Devolve None se nao
+    houver nenhum ou se houver mais de um (ambiguo)."""
+    sns=[sn for sn,d in reg["devices"].items() if d.get("last_ip")==ip]
+    return sns[0] if len(sns)==1 else None
+
 def get_device(reg, sn):
     return reg["devices"].get(sn, {})
 
@@ -403,8 +409,12 @@ def ensure_device(ip, reg, wait=API_WAIT):
     sn=info.get("sn") if info else None
     name=info.get("aliasName") if info else None
     if not sn:
-        print(f"{C['y']}TB em {ip} nao respondeu a busca; digite os dados.{C['n']}")
-        sn=input("  SN da TB (etiqueta do aparelho): ").strip()
+        sn=sn_by_last_ip(reg, ip)
+        if sn:
+            print(f"{C['y']}TB em {ip} nao respondeu a busca; usando o cadastro (ultimo IP conhecido).{C['n']}")
+        else:
+            print(f"{C['y']}TB em {ip} nao respondeu a busca; digite os dados.{C['n']}")
+            sn=input("  SN da TB (etiqueta do aparelho): ").strip()
     d=get_device(reg, sn)
     tentativas=[]
     if d.get("password"): tentativas.append(d["password"])

@@ -172,6 +172,60 @@ class TestDropSelf(unittest.TestCase):
         self.assertEqual(tbadb.drop_self(found, set()), found)
 
 
+class TestSnByLastIp(unittest.TestCase):
+    def test_um_match_devolve_sn(self):
+        reg = {"version": 2, "devices": {
+            "SN1": {"last_ip": "192.168.3.52"},
+            "SN2": {"last_ip": "192.168.3.54"},
+        }}
+        self.assertEqual(tbadb.sn_by_last_ip(reg, "192.168.3.52"), "SN1")
+
+    def test_sem_match_devolve_none(self):
+        reg = {"version": 2, "devices": {"SN1": {"last_ip": "192.168.3.52"}}}
+        self.assertIsNone(tbadb.sn_by_last_ip(reg, "192.168.3.99"))
+
+    def test_dois_com_mesmo_last_ip_devolve_none(self):
+        reg = {"version": 2, "devices": {
+            "SN1": {"last_ip": "192.168.3.52"},
+            "SN2": {"last_ip": "192.168.3.52"},
+        }}
+        self.assertIsNone(tbadb.sn_by_last_ip(reg, "192.168.3.52"))
+
+    def test_registro_sem_last_ip_devolve_none(self):
+        reg = {"version": 2, "devices": {"SN1": {"password": "x"}}}
+        self.assertIsNone(tbadb.sn_by_last_ip(reg, "192.168.3.52"))
+
+
+class TestEnsureDeviceLastIpFallback(unittest.TestCase):
+    """Logo apos reboot, o UDP (probe_avon) pode nao responder por um tempo. Se o
+    cadastro ja tiver esse IP como last_ip de exatamente uma TB, ensure_device deve usar
+    o SN dela em vez de perguntar."""
+
+    def setUp(self):
+        self._orig_login = tbadb.login
+        self._orig_probe_avon = tbadb.probe_avon
+        self._orig_save_reg = tbadb.save_reg
+        tbadb.probe_avon = lambda ip, wait=1.5: None
+        tbadb.save_reg = lambda reg: None
+
+    def tearDown(self):
+        tbadb.login = self._orig_login
+        tbadb.probe_avon = self._orig_probe_avon
+        tbadb.save_reg = self._orig_save_reg
+
+    def test_usa_sn_do_cadastro_pelo_last_ip_sem_perguntar(self):
+        reg = {"version": 2, "devices": {"SNTESTE2": {"password": "abc123", "last_ip": "10.0.0.9"}}}
+        def fake_login(ip, sn, pw=tbadb.DEF_PASS):
+            if pw == "abc123": return "tok-fake"
+            raise tbadb.AuthError("sn not match")
+        tbadb.login = fake_login
+        with patch("builtins.input") as mock_input:
+            sn, d, tok = tbadb.ensure_device("10.0.0.9", reg, wait=5)
+        mock_input.assert_not_called()
+        self.assertEqual(sn, "SNTESTE2")
+        self.assertEqual(tok, "tok-fake")
+
+
 class TestEnsureDevicePasswordFallback(unittest.TestCase):
     """Bug critico do round 1: login() reporta SN/senha errados como HTTP 200 com
     code != 0 (RuntimeError comum antes da correcao). O loop de ensure_device so pegava
