@@ -13,6 +13,13 @@ SSH_PORT = 1212
 DEF_USER = "admin"
 DEF_PASS = "123456"          # senha de login/SSH (confirmada na TB2)
 ADB_PORT = 5555
+# Protocolo de busca do ViPlex: UDP, pedido de 24 bytes em broadcast/unicast p/ 16601 e 16611.
+# A TB responde por unicast, com um cabecalho de 24 bytes + JSON (SN, nome, modelo, tela...).
+AVON_REQUEST = bytes.fromhex("41564f4effffffff55888100010000000000000000008f00")
+AVON_UNICAST_PORT = 16601
+AVON_PORTS = (16601, 16611)
+DEEP_TCP_TIMEOUT = 1.5
+DEEP_TCP_TRIES = 2
 SSH_OPTS = [
     "-p", str(SSH_PORT),
     "-o","StrictHostKeyChecking=no","-o",f"UserKnownHostsFile={os.devnull}",
@@ -24,13 +31,56 @@ SSH_OPTS = [
 C = dict(g="\033[32m", r="\033[31m", y="\033[33m", b="\033[34m", d="\033[2m", n="\033[0m", bold="\033[1m")
 if os.name=="nt": os.system("")   # liga as cores ANSI no console do Windows
 
+def migrate_registry(old):
+    """Converte o cadastro antigo (chave = IP) para o v2 (chave = SN). Pura: nao le nem
+    grava arquivo. Agrupa por SN; entre entradas com o mesmo SN, uma 192.168.* vence uma
+    192.169.* (a TB por USB troca de IP 192.169.x.x a cada conexao); last_ip so vem de
+    uma 192.168.*. Se ja for v2, devolve como esta."""
+    if isinstance(old, dict) and old.get("version") == 2 and isinstance(old.get("devices"), dict):
+        return old
+    devices = {}
+    for ip, d in (old or {}).items():
+        if not isinstance(d, dict): continue
+        sn = d.get("sn")
+        if not sn: continue
+        e = devices.setdefault(sn, {})
+        is_168 = ip.startswith("192.168.")
+        for field in ("password", "ssh_password", "name"):
+            if d.get(field) and (field not in e or is_168):
+                e[field] = d[field]
+        if is_168:
+            e["last_ip"] = ip
+    return {"version": 2, "devices": devices}
+
 def load_reg():
     try:
-        with open(REG_FILE) as f: return json.load(f)
-    except Exception: return {}
+        with open(REG_FILE) as f: raw=json.load(f)
+    except Exception: raw={}
+    if not isinstance(raw, dict): raw={}
+    return migrate_registry(raw)
+
 def save_reg(reg):
     os.makedirs(CFG_DIR, exist_ok=True)
+    # migracao: so grava o formato novo depois de uma operacao que ja ia salvar, e faz
+    # um backup do arquivo antigo (uma vez so) antes de sobrescrever
+    if os.path.exists(REG_FILE):
+        try:
+            with open(REG_FILE) as f: cur=json.load(f)
+        except Exception: cur=None
+        bak=REG_FILE+".bak"
+        if isinstance(cur,dict) and cur.get("version")!=2 and not os.path.exists(bak):
+            shutil.copyfile(REG_FILE, bak)
     with open(REG_FILE,"w") as f: json.dump(reg,f,indent=2)
+
+def get_device(reg, sn):
+    return reg["devices"].get(sn, {})
+
+def set_device(reg, sn, **fields):
+    d=reg["devices"].setdefault(sn, {})
+    d.update({k:v for k,v in fields.items() if v})
+    reg["devices"][sn]=d
+    save_reg(reg)
+    return d
 
 def tcp_open(ip, port, t=1.0):
     s=socket.socket(); s.settimeout(t)
@@ -199,45 +249,136 @@ def net_info():
     if os.name=="nt": return _net_win(_out(["route","print","-4"]))
     return _net_linux(_out(["ip","-o","-4","route","show"]), _out(["ip","-o","-4","addr","show"]))
 
+def parse_avon(data):
+    """Decodifica uma resposta do protocolo de busca do ViPlex (AVON, UDP). Cabecalho de
+    24 bytes (AVON/ffffffff/5588/0100/00000000 + tamanho do JSON em 4 bytes LE + 4 bytes
+    ignorados) seguido do JSON. Devolve o dict do JSON, ou None se invalido."""
+    if len(data) < 24: return None
+    if (data[0:4]!=b"AVON" or data[4:8]!=b"\xff\xff\xff\xff" or data[8:10]!=b"\x55\x88"
+            or data[10:12]!=b"\x01\x00" or data[12:16]!=b"\x00\x00\x00\x00"):
+        return None
+    n=int.from_bytes(data[16:20],"little")
+    if n<=0 or 24+n>len(data): return None
+    try: return json.loads(data[24:24+n].decode("utf-8"))
+    except Exception: return None
+
+def discover_udp(cands, rounds=3, wait=2.0):
+    """Manda AVON_REQUEST em unicast (16601) para cada candidato e em broadcast (16601 e
+    16611) para 255.255.255.255 e o .255 de cada /24 representada em cands, por `rounds`
+    vezes, e coleta as respostas por ate `wait` s depois do ultimo envio. sendto pode
+    lancar OSError/TimeoutError enquanto o ARP resolve (por isso um socket bloqueante
+    para enviar, sem timeout, ignorando o erro; o timeout so entra na hora de receber)."""
+    cands=list(cands)
+    bcasts={"255.255.255.255"} | {ip.rsplit(".",1)[0]+".255" for ip in cands}
+    s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    found={}
+    try:
+        for i in range(rounds):
+            for ip in cands:
+                try: s.sendto(AVON_REQUEST, (ip, AVON_UNICAST_PORT))
+                except OSError: pass
+            for bc in bcasts:
+                for port in AVON_PORTS:
+                    try: s.sendto(AVON_REQUEST, (bc, port))
+                    except OSError: pass
+            if i < rounds-1: time.sleep(0.3)
+        s.settimeout(0.5)
+        t0=time.time()
+        while time.time()-t0 < wait:
+            try: data,addr=s.recvfrom(65535)
+            except socket.timeout: continue
+            except OSError: break
+            info=parse_avon(data)
+            if info: found[addr[0]]=info
+    finally:
+        s.close()
+    return found
+
 def discover(deep=False):
-    """Acha TBs: gateways + (opcional) varredura /24, testando a porta 16674."""
-    reg=load_reg(); found={}
+    """Acha TBs como o ViPlex: busca UDP (padrao) em gateways + IPs cadastrados + todas as
+    sub-redes /24 locais. Uma TB que nao responder ao UDP ainda pode ser achada por TCP na
+    16674 (so com --deep, porque a varredura completa demora mais)."""
+    reg=load_reg()
     gws,bases=net_info()
-    cands=set(gws) | set(reg.keys())
+    last_ips={d["last_ip"] for d in reg["devices"].values() if d.get("last_ip")}
+    cands=set(gws) | last_ips
+    for base in bases:
+        cands|={f"{base}.{i}" for i in range(1,255)}
+    found={ip:dict(info, via="udp") for ip,info in discover_udp(cands, rounds=3, wait=2.0).items()}
     if deep:
-        for base in bases:
-            cands|={f"{base}.{i}" for i in range(1,255)}
-    from concurrent.futures import ThreadPoolExecutor
-    def chk(ip): return ip if tcp_open(ip,API_PORT,0.4) else None
-    with ThreadPoolExecutor(128) as ex:
-        for ip in ex.map(chk, cands):
-            if ip: found[ip]=reg.get(ip,{})
+        from concurrent.futures import ThreadPoolExecutor
+        missing=cands-set(found)
+        def chk(ip):
+            for _ in range(DEEP_TCP_TRIES):
+                if tcp_open(ip,API_PORT,DEEP_TCP_TIMEOUT): return ip
+            return None
+        with ThreadPoolExecutor(128) as ex:
+            for ip in ex.map(chk, missing):
+                if ip: found[ip]={"via":"tcp"}
     return found, reg
 
+def resolve_target(found, target):
+    """Resolve um alvo de on/off/shell dentro do resultado da busca (funcao pura). Um IP e
+    sempre aceito direto. SN e aliasName sao tentados por igualdade exata e, se nao achar,
+    por sufixo (util p/ digitar so o fim do SN/nome). Ambiguo ou nao encontrado: erro
+    listando os candidatos."""
+    if IPV4.fullmatch(target): return target
+    def cands_msg(ips):
+        itens=[f"{ip} ({found[ip].get('sn','?')}, {found[ip].get('aliasName','?')})" for ip in sorted(ips)]
+        return "; ".join(itens)
+    exact=[ip for ip,info in found.items() if target in (info.get("sn"), info.get("aliasName"))]
+    if len(exact)==1: return exact[0]
+    if len(exact)>1: raise RuntimeError(f"alvo '{target}' ambiguo: {cands_msg(exact)}")
+    suf=[ip for ip,info in found.items()
+         if (info.get("sn") or "").endswith(target) or (info.get("aliasName") or "").endswith(target)]
+    if len(suf)==1: return suf[0]
+    if len(suf)>1: raise RuntimeError(f"alvo '{target}' ambiguo: {cands_msg(suf)}")
+    disponiveis=cands_msg(found.keys()) if found else "nenhuma TB encontrada"
+    raise RuntimeError(f"TB '{target}' nao encontrada. Disponiveis: {disponiveis}")
+
 # ---------- acoes ----------
-def ensure_device(ip, reg):
-    """Garante que temos SN+senha do device (cache, ou pergunta uma vez)."""
-    d=reg.get(ip,{})
-    if d.get("sn"): return d
-    print(f"{C['y']}TB em {ip} ainda nao cadastrada.{C['n']}")
-    sn=input("  SN da TB (etiqueta do aparelho): ").strip()
-    pw=input(f"  senha [{DEF_PASS}]: ").strip() or DEF_PASS
-    # validar
-    try:
-        login_wait(ip, sn, pw); print(f"  {C['g']}ok, credenciais validas{C['n']}")
-    except Exception as e:
-        print(f"  {C['r']}nao validou: {e}{C['n']}");
-    d={"sn":sn,"password":pw,"name":d.get("name","")}
-    reg[ip]=d; save_reg(reg); return d
+def probe_avon(ip, wait=1.5):
+    """Manda AVON_REQUEST em unicast pra um unico IP (3 tentativas) e devolve a resposta,
+    se houver. Usado para achar o SN/nome de uma TB sem pedir login."""
+    return discover_udp({ip}, rounds=3, wait=wait).get(ip)
+
+def ensure_device(ip, reg, wait=API_WAIT):
+    """Garante que temos SN+senha do device. O SN vem da busca UDP (sem login); so pergunta
+    ao usuario se a TB nao responder. A senha tenta primeiro a do cadastro, depois a
+    padrao, e so entao pergunta."""
+    info=probe_avon(ip)
+    sn=info.get("sn") if info else None
+    name=info.get("aliasName") if info else None
+    if not sn:
+        print(f"{C['y']}TB em {ip} nao respondeu a busca; digite os dados.{C['n']}")
+        sn=input("  SN da TB (etiqueta do aparelho): ").strip()
+    d=get_device(reg, sn)
+    tentativas=[]
+    if d.get("password"): tentativas.append(d["password"])
+    if DEF_PASS not in tentativas: tentativas.append(DEF_PASS)
+    pw=None
+    for cand in tentativas:
+        try:
+            login_wait(ip, sn, cand, wait); pw=cand; break
+        except urllib.error.HTTPError:
+            continue
+    if pw is None:
+        pw=input(f"  senha [{DEF_PASS}]: ").strip() or DEF_PASS
+        try:
+            login_wait(ip, sn, pw, wait); print(f"  {C['g']}ok, credenciais validas{C['n']}")
+        except Exception as e:
+            print(f"  {C['r']}nao validou: {e}{C['n']}")
+    return set_device(reg, sn, sn=sn, password=pw, name=d.get("name") or name, last_ip=ip)
 
 def adb_status(ip):
     return "ligado" if tcp_open(ip,ADB_PORT,0.6) else "desligado"
 
-def find_ssh_pw(ip, reg, login_pw):
+def find_ssh_pw(ip, sn, reg, login_pw):
     # A senha do SSH pode diferir da de conexao: nos players rk356x/rk3328 (ex.: T40,
     # Android 11) o dropbear usa a fixa "novastar2008"; nos rk312x (ex.: T2) usa a de
     # conexao. Tenta na ordem e memoriza a que funciona.
-    d=reg.get(ip,{}); cands=[]
+    d=get_device(reg, sn); cands=[]
     if d.get("ssh_password"): cands.append(d["ssh_password"])
     cands += [login_pw, "novastar2008", DEF_PASS]
     seen=set()
@@ -246,16 +387,16 @@ def find_ssh_pw(ip, reg, login_pw):
         seen.add(p)
         rc,out,_=ssh_run(ip,"echo OK", p)
         if rc==0 and "OK" in out:
-            if d.get("ssh_password")!=p: d["ssh_password"]=p; reg[ip]=d; save_reg(reg)
+            if d.get("ssh_password")!=p: set_device(reg, sn, ssh_password=p)
             return p
     raise RuntimeError("nenhuma senha SSH funcionou (tentei: %s)"%", ".join(seen))
 
 def adb_set(ip, reg, on=True, wait=API_WAIT):
-    d=ensure_device(ip,reg); login_pw=d.get("password",DEF_PASS)
+    d=ensure_device(ip,reg,wait); sn=d["sn"]; login_pw=d.get("password",DEF_PASS)
     print(f"  login em {ip}...", flush=True)
-    tok=login_wait(ip, d["sn"], login_pw, wait)
+    tok=login_wait(ip, sn, login_pw, wait)
     print("  habilitando SSH...", flush=True); enable_ssh(ip,tok)
-    sshpw=find_ssh_pw(ip, reg, login_pw)
+    sshpw=find_ssh_pw(ip, sn, reg, login_pw)
     if on:
         # sys.adbd.enable=1: portao da NovaStar no Android 11 (sem isso o adbd fecha
         # toda conexao com CLSE). Inofensivo em players que nao tem o portao.
@@ -270,6 +411,7 @@ def adb_set(ip, reg, on=True, wait=API_WAIT):
         for _ in range(8):
             if tcp_open(ip,ADB_PORT): break
             time.sleep(1)
+    set_device(reg, sn, last_ip=ip)   # registra o IP que funcionou
     return adb_status(ip)
 
 def do_connect(ip):
@@ -280,13 +422,17 @@ def do_connect(ip):
     subprocess.run(["adb","connect",f"{ip}:{ADB_PORT}"])
 
 # ---------- UI ----------
-def fmt_list(found, reg):
+def fmt_list(found):
     rows=[]
-    for ip,d in sorted(found.items()):
-        name=reg.get(ip,{}).get("name") or "(sem nome)"
-        sn=reg.get(ip,{}).get("sn") or "?"
+    for ip,info in sorted(found.items()):
+        name=info.get("aliasName") or "(sem nome)"
+        modelo=info.get("productName") or "?"
+        plataforma=info.get("platform") or "?"
+        sn=info.get("sn") or "?"
+        w,h=info.get("width"),info.get("height")
+        tela=f"{w}x{h}" if w and h else "?"
         st=adb_status(ip); col=C['g'] if st=="ligado" else C['d']
-        rows.append((ip,name,sn,st,col))
+        rows.append((ip,name,modelo,plataforma,sn,tela,st,col))
     return rows
 
 def cmd_list(deep=False):
@@ -294,9 +440,9 @@ def cmd_list(deep=False):
     found,reg=discover(deep)
     if not found:
         print(f"{C['y']}nenhuma TB encontrada. (tente: tb-adb list --deep){C['n']}"); return found,reg
-    print(f"\n{C['bold']}{'IP':<16}{'NOME':<20}{'SN':<22}ADB{C['n']}")
-    for ip,name,sn,st,col in fmt_list(found,reg):
-        print(f"{col}{ip:<16}{name:<20}{sn:<22}{st}{C['n']}")
+    print(f"\n{C['bold']}{'IP':<16}{'NOME':<20}{'MODELO':<12}{'PLATAFORMA':<12}{'SN':<22}{'TELA':<10}ADB{C['n']}")
+    for ip,name,modelo,plataforma,sn,tela,st,col in fmt_list(found):
+        print(f"{col}{ip:<16}{name:<20}{modelo:<12}{plataforma:<12}{sn:<22}{tela:<10}{st}{C['n']}")
     print()
     return found,reg
 
@@ -323,12 +469,26 @@ def menu():
                 print(f"  {C['r']}erro: {e}{C['n']}")
             input("enter...")
 
+def resolve_ip(target, wait=2.0):
+    """Resolve um alvo (IP, SN, aliasName ou sufixo) pra um IP, buscando por UDP quando
+    nao for um IP direto."""
+    if IPV4.fullmatch(target): return target
+    print(f"{C['d']}procurando '{target}'...{C['n']}")
+    gws,bases=net_info(); reg=load_reg()
+    last_ips={d["last_ip"] for d in reg["devices"].values() if d.get("last_ip")}
+    cands=set(gws) | last_ips
+    for base in bases:
+        cands|={f"{base}.{i}" for i in range(1,255)}
+    found=discover_udp(cands, rounds=3, wait=wait)
+    return resolve_target(found, target)
+
 def main():
     ap=argparse.ArgumentParser(prog="tb-adb", description="Lista TBs NovaStar e liga/desliga ADB (sem ViPlex)")
     sub=ap.add_subparsers(dest="cmd")
     sub.add_parser("list").add_argument("--deep",action="store_true")
     for name in ("on","off","shell"):
-        sp=sub.add_parser(name); sp.add_argument("ip")
+        sp=sub.add_parser(name)
+        sp.add_argument("alvo", help="IP, SN, nome (aliasName) ou sufixo unico do SN/nome")
         sp.add_argument("--wait",type=int,default=API_WAIT,metavar="S",
                         help=f"segundos esperando o servico da TB subir (padrao {API_WAIT})")
         if name=="shell": sp.add_argument("command",nargs="?",default="sh")
@@ -338,13 +498,15 @@ def main():
     if a.cmd=="list": cmd_list(a.deep); return
     reg=load_reg()
     if a.cmd in ("on","off"):
-        st=adb_set(a.ip,reg,on=(a.cmd=="on"),wait=a.wait); print(f"adb: {st}")
-        if a.cmd=="on": do_connect(a.ip)
+        ip=resolve_ip(a.alvo)
+        st=adb_set(ip,reg,on=(a.cmd=="on"),wait=a.wait); print(f"adb: {st}")
+        if a.cmd=="on": do_connect(ip)
     elif a.cmd=="shell":
-        d=ensure_device(a.ip,reg); login_pw=d.get("password",DEF_PASS)
-        tok=login_wait(a.ip,d["sn"],login_pw,a.wait); enable_ssh(a.ip,tok)
-        pw=find_ssh_pw(a.ip,reg,login_pw)
-        sys.exit(ssh_interactive(a.ip, pw, None if a.command=="sh" else a.command))
+        ip=resolve_ip(a.alvo)
+        d=ensure_device(ip,reg,a.wait); login_pw=d.get("password",DEF_PASS)
+        tok=login_wait(ip,d["sn"],login_pw,a.wait); enable_ssh(ip,tok)
+        pw=find_ssh_pw(ip,d["sn"],reg,login_pw)
+        sys.exit(ssh_interactive(ip, pw, None if a.command=="sh" else a.command))
 
 if __name__=="__main__":
     try: main()

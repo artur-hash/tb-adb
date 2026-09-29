@@ -5,13 +5,16 @@ Lista players NovaStar Taurus (TBs) na rede e liga/desliga o ADB via Wi-Fi/LAN �
 ## Como funciona
 
 ```
-login REST (https :16674) -> liga o SSH (dropbear :1212) -> ssh -> setprop adbd -> adb connect :5555
+busca UDP (como o ViPlex) -> login REST (https :16674) -> liga o SSH (dropbear :1212) -> ssh -> setprop adbd -> adb connect :5555
 ```
 
-1. Faz login na API do player (`/terminal/core/v1/login`) com o SN e a senha da TB. Se o serviço da TB ainda estiver subindo (logo depois de ligar/reiniciar), espera até 120 s.
-2. Pela API, desliga e religa o serviço SSH (o ciclo OFF→ON é necessário depois de um reboot).
-3. Entra via SSH e liga o `adbd` em TCP na porta 5555.
-4. Roda `adb connect <ip>:5555`.
+1. **Busca.** Manda o mesmo pedido UDP de 24 bytes que o ViPlex manda (portas 16601/16611), em unicast pra cada IP das sub-redes /24 locais (e pros gateways, já que a TB por USB vira o gateway da interface) e também em broadcast. A TB responde por unicast com um JSON (SN, nome, modelo, plataforma, tela). **Não precisa de login** — é assim que o `list` já mostra SN e nome sem senha nenhuma. Uma TB que não responder ao UDP ainda é achada pela varredura TCP da porta 16674, só com `list --deep` (mais lenta).
+
+   Com um firewall local (ufw, firewalld, Windows Defender) ligado, respostas a um pedido em **broadcast** costumam ser descartadas pelo conntrack (ele não associa a resposta de um IP qualquer a um pedido mandado pra `255.255.255.255`). Por isso a busca manda o pedido também em **unicast** pra cada IP candidato — essas respostas passam pelo firewall normalmente.
+2. Faz login na API do player (`/terminal/core/v1/login`) com o SN (achado na busca) e a senha da TB. Se o serviço da TB ainda estiver subindo (logo depois de ligar/reiniciar), espera até 120 s.
+3. Pela API, desliga e religa o serviço SSH (o ciclo OFF→ON é necessário depois de um reboot).
+4. Entra via SSH e liga o `adbd` em TCP na porta 5555.
+5. Roda `adb connect <ip>:5555`.
 
 ## Requisitos
 
@@ -46,20 +49,23 @@ Depois coloque a pasta `%USERPROFILE%\tb-adb` no PATH — o `tb-adb.cmd` permite
 ## Uso
 
 ```sh
-tb-adb                      # menu interativo
-tb-adb list                 # lista TBs (gateways + IPs já cadastrados)
-tb-adb list --deep          # varre as sub-redes /24 locais procurando a porta 16674
-tb-adb on  192.168.3.52     # liga o ADB e conecta
-tb-adb off 192.168.3.52     # desliga o ADB
-tb-adb shell 192.168.3.52   # shell SSH na TB
+tb-adb                          # menu interativo
+tb-adb list                     # busca UDP (como o ViPlex): gateways + IPs cadastrados + sub-redes /24 locais
+tb-adb list --deep              # busca UDP + varredura TCP da porta 16674 (acha o que não respondeu ao UDP)
+tb-adb on  192.168.3.52         # liga o ADB e conecta (aceita IP)
+tb-adb on  25A22N000000741      # ... ou SN
+tb-adb on  Taurus-00000741      # ... ou aliasName (nome que aparece no ViPlex)
+tb-adb on  00000741             # ... ou um sufixo único do SN/nome
+tb-adb off 192.168.3.52         # desliga o ADB
+tb-adb shell 192.168.3.52       # shell SSH na TB
 tb-adb shell 192.168.3.52 "getprop ro.product.model"   # roda um comando
 ```
 
-`on`, `off` e `shell` aceitam `--wait S` (segundos esperando o serviço da TB subir; padrão 120).
+`on`, `off` e `shell` aceitam `--wait S` (segundos esperando o serviço da TB subir; padrão 120). Um alvo que não é IP é resolvido pela busca UDP; se ficar ambíguo (o sufixo bater em mais de uma TB) ou não achar nada, o erro lista as TBs candidatas.
 
-Na primeira vez que usar um IP, o script pede o **SN** (etiqueta do aparelho) e a **senha** de conexão (padrão `123456`) e salva em `~/.config/tb-adb/devices.json`.
+O cadastro (`~/.config/tb-adb/devices.json`) é **por SN**, não por IP — assim uma TB não perde o cadastro quando troca de IP (USB, DHCP). Na primeira vez que uma TB é usada, o script já sabe o **SN** e o **nome** pela própria busca (sem pedir nada) e só pergunta a **senha** se nem a salva anteriormente nem a padrão (`123456`) funcionarem. O `last_ip` (o IP que funcionou da última vez) é salvo a cada operação bem-sucedida, só pra acelerar a próxima busca.
 
-> Esse arquivo guarda SNs e senhas das suas TBs — ele fica fora do repositório e não deve ser compartilhado.
+> Esse arquivo guarda SNs e senhas das suas TBs — ele fica fora do repositório e não deve ser compartilhado. Um cadastro antigo (chave por IP) é convertido para o formato por SN automaticamente na primeira gravação; antes disso, o arquivo antigo é copiado para `devices.json.bak`.
 
 No Windows, o `shell` interativo usa o `ssh.exe` do sistema e mostra a senha para você digitar.
 
@@ -85,7 +91,7 @@ A senha do SSH pode ser diferente da de conexão. O script tenta, em ordem, e me
 O serviço da TB na porta 16674 ainda não subiu — normal logo depois de ligar/reiniciar a TB. O script espera sozinho até 120 s. Se estourar o tempo, confira se a TB está ligada e na mesma rede (`ping <ip>`). Não é preciso cabo se a TB responde ao ping.
 
 **`sn not match`**
-SN errado para aquele IP. Corrija em `~/.config/tb-adb/devices.json` (ou apague a entrada para o script perguntar de novo).
+A senha salva não bate com o SN daquela TB (raro, mas pode acontecer se duas TBs trocaram de SN no cadastro à mão). Corrija a entrada em `~/.config/tb-adb/devices.json` (chave = SN) ou apague-a para o script perguntar de novo.
 
 **`paramiko X nao suporta ssh-rsa`**
 Instale uma versão compatível: `pip install "paramiko<4"`.
@@ -96,6 +102,7 @@ Com a TB ligada por USB, ela aparece como gateway da interface USB (normalmente 
 ## Testado
 
 - Linux (Arch) + TB T2-4G (rk312x): `list`, `on`, `off`, `shell` (interativo e com comando) usando o ssh do sistema; `on` e `off` usando paramiko 3.5.1 (o backend do Windows).
+- Busca UDP: testada ao vivo numa rede com 10 TBs (T2, T10Plus, T20Plus, T40, T60) atrás do ViPlex — `list` (sem `--deep`) achou as 10 em poucos segundos, todas por UDP.
 - macOS e Windows: a descoberta de rede foi testada com saídas de exemplo de `netstat`/`ifconfig` e `route print` (inclusive Windows em português). Ainda falta rodar numa máquina macOS/Windows de verdade — se você testar, conte numa issue.
 
 ## Contribuindo
