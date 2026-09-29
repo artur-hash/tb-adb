@@ -99,12 +99,17 @@ def api(ip, path, method, token=None, body=None, t=10):
     with urllib.request.urlopen(req, context=_ctx(), timeout=t) as r:
         return json.loads(r.read().decode())
 
+class AuthError(RuntimeError):
+    """SN ou senha rejeitados pela TB (a API respondeu 200 com code != 0, ex.: 'sn not
+    match'). Diferente de erro de rede/timeout, para o loop de senhas em ensure_device
+    saber que deve tentar a proxima candidata em vez de abortar."""
+
 def login(ip, sn, pw=DEF_PASS):
     r=api(ip,"login","POST",body={
         "sn":sn,"username":DEF_USER,"password":pw,
         "clientId":os.urandom(16).hex(),"clientName":"tb-adb","loginType":9,
         "source":{"type":0,"platform":2,"platformVersion":"3.0.5"}})
-    if r.get("code")!=0: raise RuntimeError(r.get("message","login falhou"))
+    if r.get("code")!=0: raise AuthError(r.get("message","login falhou"))
     return r["data"]["token"]
 
 def login_wait(ip, sn, pw=DEF_PASS, wait=API_WAIT):
@@ -220,34 +225,48 @@ def _out(cmd):
     try: return subprocess.run(cmd,capture_output=True,timeout=5).stdout.decode(errors="replace")
     except Exception: return ""
 
-# Cada _net_* devolve (gateways padrao, bases das redes /24 locais), a partir da saida dos
-# comandos de rede do SO. A TB ligada por USB vira o gateway da interface USB (192.168.42.129).
+# Cada _net_* devolve (gateways padrao, bases das redes /24 locais, IPs locais desta
+# maquina), a partir da saida dos comandos de rede do SO. A TB ligada por USB vira o
+# gateway da interface USB (192.168.42.129).
 def _net_linux(routes, addrs):
     gws={p[p.index("via")+1] for p in map(str.split,routes.splitlines()) if "default" in p and "via" in p}
-    bases=[l.split()[3].split("/")[0].rsplit(".",1)[0] for l in addrs.splitlines()
-           if " scope global" in l and "/24" in l]
-    return gws, bases
+    locais={l.split()[3].split("/")[0] for l in addrs.splitlines() if " scope global" in l and "/24" in l}
+    bases=[ip.rsplit(".",1)[0] for ip in locais]
+    return gws, bases, locais
 
 def _net_mac(routes, ifconfig):
     gws={p[1] for p in map(str.split,routes.splitlines()) if len(p)>1 and p[0]=="default" and IPV4.fullmatch(p[1])}
-    bases=[p[1].rsplit(".",1)[0] for p in map(str.split,ifconfig.splitlines())
-           if len(p)>3 and p[0]=="inet" and p[2]=="netmask" and p[3]=="0xffffff00"]
-    return gws, bases
+    locais={p[1] for p in map(str.split,ifconfig.splitlines())
+            if len(p)>3 and p[0]=="inet" and p[2]=="netmask" and p[3]=="0xffffff00"}
+    bases=[ip.rsplit(".",1)[0] for ip in locais]
+    return gws, bases, locais
 
 def _net_win(routes):
     # 'route print -4': so os IPs de cada linha importam ('On-link'/'No vinculo' mudam com o idioma)
-    gws,bases=set(),[]
+    gws,bases,locais=set(),[],set()
     for l in routes.splitlines():
         ips=IPV4.findall(l)
         if len(ips)>=3 and ips[0]==ips[1]=="0.0.0.0": gws.add(ips[2])
         elif len(ips)==3 and ips[1]=="255.255.255.0" and not ips[2].startswith(("127.","169.254.")):
-            bases.append(ips[2].rsplit(".",1)[0])
-    return gws, bases
+            bases.append(ips[2].rsplit(".",1)[0]); locais.add(ips[2])
+    return gws, bases, locais
+
+def _local_ips_fallback():
+    # Complementa o que os parsers acima acharem: portatil, sem depender do formato de
+    # saida de nenhum comando (util sobretudo se o parser do SO nao pegar alguma interface).
+    try:
+        return set(socket.gethostbyname_ex(socket.gethostname())[2])
+    except Exception:
+        return set()
 
 def net_info():
-    if sys.platform=="darwin": return _net_mac(_out(["netstat","-rn","-f","inet"]), _out(["ifconfig"]))
-    if os.name=="nt": return _net_win(_out(["route","print","-4"]))
-    return _net_linux(_out(["ip","-o","-4","route","show"]), _out(["ip","-o","-4","addr","show"]))
+    if sys.platform=="darwin":
+        gws,bases,locais=_net_mac(_out(["netstat","-rn","-f","inet"]), _out(["ifconfig"]))
+    elif os.name=="nt":
+        gws,bases,locais=_net_win(_out(["route","print","-4"]))
+    else:
+        gws,bases,locais=_net_linux(_out(["ip","-o","-4","route","show"]), _out(["ip","-o","-4","addr","show"]))
+    return gws, bases, locais|_local_ips_fallback()
 
 def parse_avon(data):
     """Decodifica uma resposta do protocolo de busca do ViPlex (AVON, UDP). Cabecalho de
@@ -262,50 +281,80 @@ def parse_avon(data):
     try: return json.loads(data[24:24+n].decode("utf-8"))
     except Exception: return None
 
-def discover_udp(cands, rounds=3, wait=2.0):
+def drop_self(found, local_ips):
+    """Remove do resultado da busca respostas vindas dos proprios IPv4 desta maquina
+    (funcao pura)."""
+    return {ip: info for ip, info in found.items() if ip not in local_ips}
+
+def discover_udp(cands, rounds=3, wait=2.0, local_ips=frozenset()):
     """Manda AVON_REQUEST em unicast (16601) para cada candidato e em broadcast (16601 e
     16611) para 255.255.255.255 e o .255 de cada /24 representada em cands, por `rounds`
-    vezes, e coleta as respostas por ate `wait` s depois do ultimo envio. sendto pode
-    lancar OSError/TimeoutError enquanto o ARP resolve (por isso um socket bloqueante
-    para enviar, sem timeout, ignorando o erro; o timeout so entra na hora de receber)."""
+    vezes, e coleta as respostas por ate `wait` s depois do ultimo envio.
+
+    sendto pode bloquear enquanto o ARP resolve (por isso um socket bloqueante para
+    enviar, sem timeout, ignorando o OSError de cada envio - o timeout so entra na hora
+    de receber). Um UDP socket so' bloqueia por causa do ARP no host que o esta usando
+    *naquele momento*: threads concorrentes que dividem um UNICO socket serializam esse
+    bloqueio (medido: ~3s pra 254 IPs, quase igual ao envio serial). Por isso cada thread
+    do pool usa seu proprio socket (thread-local); todos ficam abertos ate o fim do
+    `wait`, porque a TB responde pro IP:porta exatos de quem mandou o pedido. `local_ips`
+    filtra respostas vindas desta propria maquina."""
+    import threading, selectors
+    from concurrent.futures import ThreadPoolExecutor
     cands=list(cands)
     bcasts={"255.255.255.255"} | {ip.rsplit(".",1)[0]+".255" for ip in cands}
-    s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    n_workers=min(64, max(1,len(cands)))
+    tls=threading.local(); socks=[]; lock=threading.Lock()
+    def send_unicast(ip):
+        s=getattr(tls,"s",None)
+        if s is None:
+            s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            tls.s=s
+            with lock: socks.append(s)
+        try: s.sendto(AVON_REQUEST, (ip, AVON_UNICAST_PORT))
+        except OSError: pass
+    bsock=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    bsock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     found={}
     try:
-        for i in range(rounds):
-            for ip in cands:
-                try: s.sendto(AVON_REQUEST, (ip, AVON_UNICAST_PORT))
-                except OSError: pass
-            for bc in bcasts:
-                for port in AVON_PORTS:
-                    try: s.sendto(AVON_REQUEST, (bc, port))
-                    except OSError: pass
-            if i < rounds-1: time.sleep(0.3)
-        s.settimeout(0.5)
+        with ThreadPoolExecutor(n_workers) as ex:
+            for i in range(rounds):
+                list(ex.map(send_unicast, cands))
+                for bc in bcasts:
+                    for port in AVON_PORTS:
+                        try: bsock.sendto(AVON_REQUEST, (bc, port))
+                        except OSError: pass
+                if i < rounds-1: time.sleep(0.3)
+        all_socks=socks+[bsock]
+        sel=selectors.DefaultSelector()
+        for s in all_socks:
+            s.setblocking(False); sel.register(s, selectors.EVENT_READ)
         t0=time.time()
-        while time.time()-t0 < wait:
-            try: data,addr=s.recvfrom(65535)
-            except socket.timeout: continue
-            except OSError: break
-            info=parse_avon(data)
-            if info: found[addr[0]]=info
+        while True:
+            restante=wait-(time.time()-t0)
+            if restante<=0: break
+            for key,_ in sel.select(timeout=min(restante,0.5)):
+                try: data,addr=key.fileobj.recvfrom(65535)
+                except OSError: continue
+                info=parse_avon(data)
+                if info: found[addr[0]]=info
     finally:
-        s.close()
-    return found
+        for s in socks+[bsock]:
+            try: s.close()
+            except OSError: pass
+    return drop_self(found, local_ips)
 
 def discover(deep=False):
     """Acha TBs como o ViPlex: busca UDP (padrao) em gateways + IPs cadastrados + todas as
     sub-redes /24 locais. Uma TB que nao responder ao UDP ainda pode ser achada por TCP na
     16674 (so com --deep, porque a varredura completa demora mais)."""
     reg=load_reg()
-    gws,bases=net_info()
+    gws,bases,local_ips=net_info()
     last_ips={d["last_ip"] for d in reg["devices"].values() if d.get("last_ip")}
     cands=set(gws) | last_ips
     for base in bases:
         cands|={f"{base}.{i}" for i in range(1,255)}
-    found={ip:dict(info, via="udp") for ip,info in discover_udp(cands, rounds=3, wait=2.0).items()}
+    found={ip:dict(info, via="udp") for ip,info in discover_udp(cands, rounds=3, wait=2.0, local_ips=local_ips).items()}
     if deep:
         from concurrent.futures import ThreadPoolExecutor
         missing=cands-set(found)
@@ -344,9 +393,12 @@ def probe_avon(ip, wait=1.5):
     return discover_udp({ip}, rounds=3, wait=wait).get(ip)
 
 def ensure_device(ip, reg, wait=API_WAIT):
-    """Garante que temos SN+senha do device. O SN vem da busca UDP (sem login); so pergunta
-    ao usuario se a TB nao responder. A senha tenta primeiro a do cadastro, depois a
-    padrao, e so entao pergunta."""
+    """Garante que temos SN+senha do device e faz UM login (devolve token pra reusar,
+    evitando logar de novo em seguida). O SN vem da busca UDP (sem login); so pergunta ao
+    usuario se a TB nao responder. A senha tenta primeiro a do cadastro, depois a padrao,
+    e so entao pergunta. SN/senha errados (AuthError/HTTPError) passam pra proxima
+    candidata; erro de rede/timeout (RuntimeError comum, de login_wait) propaga na hora -
+    nao adianta ciclar senha se a TB nem respondeu. Devolve (sn, device, token)."""
     info=probe_avon(ip)
     sn=info.get("sn") if info else None
     name=info.get("aliasName") if info else None
@@ -357,19 +409,20 @@ def ensure_device(ip, reg, wait=API_WAIT):
     tentativas=[]
     if d.get("password"): tentativas.append(d["password"])
     if DEF_PASS not in tentativas: tentativas.append(DEF_PASS)
-    pw=None
+    pw=tok=None
     for cand in tentativas:
         try:
-            login_wait(ip, sn, cand, wait); pw=cand; break
-        except urllib.error.HTTPError:
+            tok=login_wait(ip, sn, cand, wait); pw=cand; break
+        except (urllib.error.HTTPError, AuthError):
             continue
     if pw is None:
         pw=input(f"  senha [{DEF_PASS}]: ").strip() or DEF_PASS
         try:
-            login_wait(ip, sn, pw, wait); print(f"  {C['g']}ok, credenciais validas{C['n']}")
-        except Exception as e:
-            print(f"  {C['r']}nao validou: {e}{C['n']}")
-    return set_device(reg, sn, sn=sn, password=pw, name=d.get("name") or name, last_ip=ip)
+            tok=login_wait(ip, sn, pw, wait); print(f"  {C['g']}ok, credenciais validas{C['n']}")
+        except (urllib.error.HTTPError, AuthError) as e:
+            raise RuntimeError(f"credenciais invalidas para {ip}: {e}") from None
+    d=set_device(reg, sn, password=pw, name=d.get("name") or name, last_ip=ip)
+    return sn, d, tok
 
 def adb_status(ip):
     return "ligado" if tcp_open(ip,ADB_PORT,0.6) else "desligado"
@@ -392,9 +445,8 @@ def find_ssh_pw(ip, sn, reg, login_pw):
     raise RuntimeError("nenhuma senha SSH funcionou (tentei: %s)"%", ".join(seen))
 
 def adb_set(ip, reg, on=True, wait=API_WAIT):
-    d=ensure_device(ip,reg,wait); sn=d["sn"]; login_pw=d.get("password",DEF_PASS)
     print(f"  login em {ip}...", flush=True)
-    tok=login_wait(ip, sn, login_pw, wait)
+    sn,d,tok=ensure_device(ip,reg,wait); login_pw=d.get("password",DEF_PASS)
     print("  habilitando SSH...", flush=True); enable_ssh(ip,tok)
     sshpw=find_ssh_pw(ip, sn, reg, login_pw)
     if on:
@@ -469,17 +521,17 @@ def menu():
                 print(f"  {C['r']}erro: {e}{C['n']}")
             input("enter...")
 
-def resolve_ip(target, wait=2.0):
+def resolve_ip(target, reg, wait=2.0):
     """Resolve um alvo (IP, SN, aliasName ou sufixo) pra um IP, buscando por UDP quando
     nao for um IP direto."""
     if IPV4.fullmatch(target): return target
     print(f"{C['d']}procurando '{target}'...{C['n']}")
-    gws,bases=net_info(); reg=load_reg()
+    gws,bases,local_ips=net_info()
     last_ips={d["last_ip"] for d in reg["devices"].values() if d.get("last_ip")}
     cands=set(gws) | last_ips
     for base in bases:
         cands|={f"{base}.{i}" for i in range(1,255)}
-    found=discover_udp(cands, rounds=3, wait=wait)
+    found=discover_udp(cands, rounds=3, wait=wait, local_ips=local_ips)
     return resolve_target(found, target)
 
 def main():
@@ -498,14 +550,14 @@ def main():
     if a.cmd=="list": cmd_list(a.deep); return
     reg=load_reg()
     if a.cmd in ("on","off"):
-        ip=resolve_ip(a.alvo)
+        ip=resolve_ip(a.alvo, reg)
         st=adb_set(ip,reg,on=(a.cmd=="on"),wait=a.wait); print(f"adb: {st}")
         if a.cmd=="on": do_connect(ip)
     elif a.cmd=="shell":
-        ip=resolve_ip(a.alvo)
-        d=ensure_device(ip,reg,a.wait); login_pw=d.get("password",DEF_PASS)
-        tok=login_wait(ip,d["sn"],login_pw,a.wait); enable_ssh(ip,tok)
-        pw=find_ssh_pw(ip,d["sn"],reg,login_pw)
+        ip=resolve_ip(a.alvo, reg)
+        sn,d,tok=ensure_device(ip,reg,a.wait); login_pw=d.get("password",DEF_PASS)
+        enable_ssh(ip,tok)
+        pw=find_ssh_pw(ip,sn,reg,login_pw)
         sys.exit(ssh_interactive(ip, pw, None if a.command=="sh" else a.command))
 
 if __name__=="__main__":

@@ -1,9 +1,11 @@
-# Testes de unidade do tb-adb (so as funcoes puras: parse_avon, migrate_registry,
-# resolve_target). Carrega o script sem extensao via SourceFileLoader.
+# Testes de unidade do tb-adb (as funcoes puras: parse_avon, migrate_registry,
+# resolve_target, drop_self; mais o fallback de senha do ensure_device, com login_wait
+# trocado por um fake). Carrega o script sem extensao via SourceFileLoader.
 import json
 import struct
 import unittest
 from importlib.machinery import SourceFileLoader
+from unittest.mock import patch
 
 tbadb = SourceFileLoader("tbadb", "tb-adb").load_module()
 
@@ -152,6 +154,96 @@ class TestResolveTarget(unittest.TestCase):
             self.assertIn("192.168.3.60", msg)
         else:
             self.fail("deveria ter levantado erro de ambiguidade")
+
+
+class TestDropSelf(unittest.TestCase):
+    def test_remove_respostas_da_propria_maquina(self):
+        found = {
+            "192.168.3.54": {"sn": "25A22N000000741"},
+            "192.168.3.50": {"sn": "NAO-E-UMA-TB"},
+        }
+        self.assertEqual(
+            tbadb.drop_self(found, {"192.168.3.50"}),
+            {"192.168.3.54": {"sn": "25A22N000000741"}},
+        )
+
+    def test_sem_ips_locais_nao_remove_nada(self):
+        found = {"192.168.3.54": {"sn": "25A22N000000741"}}
+        self.assertEqual(tbadb.drop_self(found, set()), found)
+
+
+class TestEnsureDevicePasswordFallback(unittest.TestCase):
+    """Bug critico do round 1: login() reporta SN/senha errados como HTTP 200 com
+    code != 0 (RuntimeError comum antes da correcao). O loop de ensure_device so pegava
+    HTTPError, entao uma senha salva errada abortava on/off/shell em vez de cair pro
+    123456. probe_avon e save_reg sao trocados por fakes (sem rede, sem gravar
+    devices.json de verdade); login_wait tambem, para controlar exatamente quando cada
+    candidata "funciona"."""
+
+    def setUp(self):
+        self._orig_login_wait = tbadb.login_wait
+        self._orig_login = tbadb.login
+        self._orig_probe_avon = tbadb.probe_avon
+        self._orig_save_reg = tbadb.save_reg
+        tbadb.probe_avon = lambda ip, wait=1.5: {"sn": "SNTESTE1", "aliasName": "TB-Teste"}
+        tbadb.save_reg = lambda reg: None
+
+    def tearDown(self):
+        tbadb.login_wait = self._orig_login_wait
+        tbadb.login = self._orig_login
+        tbadb.probe_avon = self._orig_probe_avon
+        tbadb.save_reg = self._orig_save_reg
+
+    def _reg(self, password="velha"):
+        return {"version": 2, "devices": {"SNTESTE1": {"password": password}}}
+
+    def test_senha_velha_cai_para_123456_sem_perguntar(self):
+        # fake "login": so a 123456 autentica; a senha salva ("velha") da AuthError, como
+        # a TB de verdade faz com "sn not match" (HTTP 200, code != 0)
+        def fake_login(ip, sn, pw=tbadb.DEF_PASS):
+            if pw == "123456": return "tok-fake"
+            raise tbadb.AuthError("sn not match")
+        tbadb.login = fake_login  # login_wait chama login() pelo nome do modulo
+        with patch("builtins.input") as mock_input:
+            sn, d, tok = tbadb.ensure_device("192.168.3.9", self._reg(), wait=5)
+        mock_input.assert_not_called()
+        self.assertEqual(sn, "SNTESTE1")
+        self.assertEqual(d["password"], "123456")
+        self.assertEqual(tok, "tok-fake")
+
+    def test_ambas_erradas_pergunta_senha_e_a_digitada_funciona(self):
+        def fake_login(ip, sn, pw=tbadb.DEF_PASS):
+            if pw == "novasenha": return "tok-fake"
+            raise tbadb.AuthError("sn not match")
+        tbadb.login = fake_login
+        with patch("builtins.input", return_value="novasenha") as mock_input:
+            sn, d, tok = tbadb.ensure_device("192.168.3.9", self._reg(), wait=5)
+        mock_input.assert_called()
+        self.assertEqual(d["password"], "novasenha")
+
+    def test_ambas_erradas_e_a_digitada_tambem_falha_levanta_erro(self):
+        def fake_login(ip, sn, pw=tbadb.DEF_PASS):
+            raise tbadb.AuthError("sn not match")
+        tbadb.login = fake_login
+        with patch("builtins.input", return_value="tambem-errada") as mock_input:
+            with self.assertRaises(RuntimeError):
+                tbadb.ensure_device("192.168.3.9", self._reg(), wait=5)
+        mock_input.assert_called()
+
+    def test_falha_de_rede_propaga_sem_ciclar_senhas(self):
+        # login_wait "de verdade" so devolve RuntimeError (nao AuthError) quando estoura o
+        # tempo esperando a TB responder (erro de rede/timeout) - simulado aqui trocando
+        # login_wait direto, para nao depender do sleep(3) real do loop de retry.
+        chamadas = []
+        def fake_login_wait(ip, sn, pw, wait=tbadb.API_WAIT):
+            chamadas.append(pw)
+            raise RuntimeError(f"servico da TB em {ip}:16674 nao respondeu em {wait}s")
+        tbadb.login_wait = fake_login_wait
+        with patch("builtins.input") as mock_input:
+            with self.assertRaises(RuntimeError):
+                tbadb.ensure_device("192.168.3.9", self._reg(), wait=5)
+        mock_input.assert_not_called()
+        self.assertEqual(len(chamadas), 1)   # nao tentou a segunda senha
 
 
 if __name__ == "__main__":

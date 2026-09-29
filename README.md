@@ -63,7 +63,7 @@ tb-adb shell 192.168.3.52 "getprop ro.product.model"   # roda um comando
 
 `on`, `off` e `shell` aceitam `--wait S` (segundos esperando o serviço da TB subir; padrão 120). Um alvo que não é IP é resolvido pela busca UDP; se ficar ambíguo (o sufixo bater em mais de uma TB) ou não achar nada, o erro lista as TBs candidatas.
 
-O cadastro (`~/.config/tb-adb/devices.json`) é **por SN**, não por IP — assim uma TB não perde o cadastro quando troca de IP (USB, DHCP). Na primeira vez que uma TB é usada, o script já sabe o **SN** e o **nome** pela própria busca (sem pedir nada) e só pergunta a **senha** se nem a salva anteriormente nem a padrão (`123456`) funcionarem. O `last_ip` (o IP que funcionou da última vez) é salvo a cada operação bem-sucedida, só pra acelerar a próxima busca.
+O cadastro (`~/.config/tb-adb/devices.json`) é **por SN**, não por IP — assim uma TB não perde o cadastro quando troca de IP (USB, DHCP). Na primeira vez que uma TB é usada, o script já sabe o **SN** e o **nome** pela própria busca (sem pedir nada). Pra senha, tenta logar com a salva anteriormente; se a TB recusar (SN/senha errados), tenta a padrão (`123456`); só se as duas forem recusadas é que pergunta a senha no terminal. Um erro de rede (TB desligada, fora do alcance) não entra nesse ciclo — ele aparece na hora, sem tentar as outras senhas à toa. O `last_ip` (o IP que funcionou da última vez) é salvo a cada operação bem-sucedida, só pra acelerar a próxima busca.
 
 > Esse arquivo guarda SNs e senhas das suas TBs — ele fica fora do repositório e não deve ser compartilhado. Um cadastro antigo (chave por IP) é convertido para o formato por SN automaticamente na primeira gravação; antes disso, o arquivo antigo é copiado para `devices.json.bak`.
 
@@ -90,8 +90,8 @@ A senha do SSH pode ser diferente da de conexão. O script tenta, em ordem, e me
 **`servico da TB ainda nao respondeu (... Connection refused)`**
 O serviço da TB na porta 16674 ainda não subiu — normal logo depois de ligar/reiniciar a TB. O script espera sozinho até 120 s. Se estourar o tempo, confira se a TB está ligada e na mesma rede (`ping <ip>`). Não é preciso cabo se a TB responde ao ping.
 
-**`sn not match`**
-A senha salva não bate com o SN daquela TB (raro, mas pode acontecer se duas TBs trocaram de SN no cadastro à mão). Corrija a entrada em `~/.config/tb-adb/devices.json` (chave = SN) ou apague-a para o script perguntar de novo.
+**`sn not match` / `credenciais invalidas para <ip>`**
+A TB recusou o SN/senha. Isso normalmente se resolve sozinho: o script já tenta a senha salva e depois a padrão (`123456`) antes de perguntar. Se aparecer esse erro é porque a senha digitada na hora também foi recusada — confira a etiqueta da TB e tente de novo, ou corrija/apague a entrada em `~/.config/tb-adb/devices.json` (chave = SN).
 
 **`paramiko X nao suporta ssh-rsa`**
 Instale uma versão compatível: `pip install "paramiko<4"`.
