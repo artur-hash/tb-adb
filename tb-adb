@@ -326,18 +326,18 @@ def discover_udp(cands, rounds=3, wait=2.0, local_ips=frozenset()):
                         except OSError: pass
                 if i < rounds-1: time.sleep(0.3)
         all_socks=socks+[bsock]
-        sel=selectors.DefaultSelector()
-        for s in all_socks:
-            s.setblocking(False); sel.register(s, selectors.EVENT_READ)
-        t0=time.time()
-        while True:
-            restante=wait-(time.time()-t0)
-            if restante<=0: break
-            for key,_ in sel.select(timeout=min(restante,0.5)):
-                try: data,addr=key.fileobj.recvfrom(65535)
-                except OSError: continue
-                info=parse_avon(data)
-                if info: found[addr[0]]=info
+        with selectors.DefaultSelector() as sel:
+            for s in all_socks:
+                s.setblocking(False); sel.register(s, selectors.EVENT_READ)
+            t0=time.time()
+            while True:
+                restante=wait-(time.time()-t0)
+                if restante<=0: break
+                for key,_ in sel.select(timeout=min(restante,0.5)):
+                    try: data,addr=key.fileobj.recvfrom(65535)
+                    except OSError: continue
+                    info=parse_avon(data)
+                    if info: found[addr[0]]=info
     finally:
         for s in socks+[bsock]:
             try: s.close()
