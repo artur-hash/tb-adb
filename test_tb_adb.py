@@ -119,6 +119,28 @@ FOUND = {
 }
 
 
+class TestMigrateKeepsDefaults(unittest.TestCase):
+    def test_v2_preserva_default_passwords(self):
+        reg = {"version": 2, "default_passwords": ["x"], "devices": {}}
+        self.assertEqual(tbadb.migrate_registry(reg)["default_passwords"], ["x"])
+
+
+class TestSaveRegPermissions(unittest.TestCase):
+    """O cadastro guarda senhas: tem que sair 0600 (so o dono le), inclusive o backup da
+    migracao, mesmo que o arquivo ja existisse com outra permissao."""
+
+    def test_cadastro_e_backup_saem_0600(self):
+        import os, stat, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            reg_file = os.path.join(tmp, "devices.json")
+            with open(reg_file, "w") as f: json.dump({"192.168.3.9": {"sn": "X"}}, f)  # formato antigo
+            os.chmod(reg_file, 0o644)
+            with patch.object(tbadb, "CFG_DIR", tmp), patch.object(tbadb, "REG_FILE", reg_file):
+                tbadb.save_reg({"version": 2, "devices": {}})
+            self.assertEqual(stat.S_IMODE(os.stat(reg_file).st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(os.stat(reg_file + ".bak").st_mode), 0o600)
+
+
 class TestResolveTarget(unittest.TestCase):
     def test_acha_por_ip(self):
         self.assertEqual(tbadb.resolve_target(FOUND, "192.168.3.54"), "192.168.3.54")
@@ -283,6 +305,35 @@ class TestEnsureDevicePasswordFallback(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 tbadb.ensure_device("192.168.3.9", self._reg(), wait=5)
         mock_input.assert_called()
+
+    def test_sem_senha_cadastrada_tenta_as_padrao_do_cadastro_sem_perguntar(self):
+        # TB nova: sem senha propria no cadastro, mas o cadastro tem a lista de senhas
+        # padrao (ex.: a de fabrica da NovaStar). Ela deve ser tentada antes de perguntar.
+        reg = {"version": 2, "default_passwords": ["fabrica"], "devices": {}}
+        def fake_login(ip, sn, pw=tbadb.DEF_PASS):
+            if pw == "fabrica": return "tok-fake"
+            raise tbadb.AuthError("password error")
+        tbadb.login = fake_login
+        with patch("builtins.input") as mock_input:
+            sn, d, tok = tbadb.ensure_device("192.168.3.9", reg, wait=5)
+        mock_input.assert_not_called()
+        self.assertEqual(d["password"], "fabrica")
+        self.assertEqual(tok, "tok-fake")
+
+    def test_ordem_das_tentativas_cadastro_padroes_e_123456(self):
+        reg = {"version": 2, "default_passwords": ["a", "b", "123456"],
+               "devices": {"SNTESTE1": {"password": "velha"}}}
+        tentadas = []
+        def fake_login(ip, sn, pw=tbadb.DEF_PASS):
+            tentadas.append(pw)
+            if pw == "123456": return "tok-fake"
+            raise tbadb.AuthError("password error")
+        tbadb.login = fake_login
+        with patch("builtins.input") as mock_input:
+            tbadb.ensure_device("192.168.3.9", reg, wait=5)
+        mock_input.assert_not_called()
+        # sem repetir a 123456, que tambem e a DEF_PASS
+        self.assertEqual(tentadas, ["velha", "a", "b", "123456"])
 
     def test_falha_de_rede_propaga_sem_ciclar_senhas(self):
         # login_wait "de verdade" so devolve RuntimeError (nao AuthError) quando estoura o

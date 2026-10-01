@@ -63,9 +63,15 @@ tb-adb shell 192.168.3.52 "getprop ro.product.model"   # roda um comando
 
 `on`, `off` e `shell` aceitam `--wait S` (segundos esperando o serviço da TB subir; padrão 120). Um alvo que não é IP é resolvido pela busca UDP; se ficar ambíguo (o sufixo bater em mais de uma TB) ou não achar nada, o erro lista as TBs candidatas.
 
-O cadastro (`~/.config/tb-adb/devices.json`) é **por SN**, não por IP — assim uma TB não perde o cadastro quando troca de IP (USB, DHCP). Na primeira vez que uma TB é usada, o script já sabe o **SN** e o **nome** pela própria busca (sem pedir nada). Pra senha, tenta logar com a salva anteriormente; se a TB recusar (SN/senha errados), tenta a padrão (`123456`); só se as duas forem recusadas é que pergunta a senha no terminal. Um erro de rede (TB desligada, fora do alcance) não entra nesse ciclo — ele aparece na hora, sem tentar as outras senhas à toa. O `last_ip` (o IP que funcionou da última vez) é salvo a cada operação bem-sucedida, só pra acelerar a próxima busca.
+O cadastro (`~/.config/tb-adb/devices.json`) é **por SN**, não por IP — assim uma TB não perde o cadastro quando troca de IP (USB, DHCP). Na primeira vez que uma TB é usada, o script já sabe o **SN** e o **nome** pela própria busca (sem pedir nada). Pra senha, tenta logar com a salva anteriormente; se a TB recusar (SN/senha errados), tenta as **senhas padrão do cadastro** e depois a `123456`; só se todas forem recusadas é que pergunta a senha no terminal.
 
-> Esse arquivo guarda SNs e senhas das suas TBs — ele fica fora do repositório e não deve ser compartilhado. Um cadastro antigo (chave por IP) é convertido para o formato por SN automaticamente na primeira gravação; antes disso, o arquivo antigo é copiado para `devices.json.bak`.
+As senhas padrão ficam numa lista `default_passwords` no próprio `devices.json`, nunca no código (o repositório é público). Serve para TBs novas, que ainda estão com a senha de fábrica:
+
+```json
+{"version": 2, "default_passwords": ["<senha de fábrica da NovaStar>"], "devices": {}}
+``` Um erro de rede (TB desligada, fora do alcance) não entra nesse ciclo — ele aparece na hora, sem tentar as outras senhas à toa. O `last_ip` (o IP que funcionou da última vez) é salvo a cada operação bem-sucedida, só pra acelerar a próxima busca.
+
+> Esse arquivo guarda SNs e senhas das suas TBs — ele fica fora do repositório, é gravado com permissão `0600` (só o dono lê) e não deve ser compartilhado. Um cadastro antigo (chave por IP) é convertido para o formato por SN automaticamente na primeira gravação; antes disso, o arquivo antigo é copiado para `devices.json.bak`.
 
 No Windows, o `shell` interativo usa o `ssh.exe` do sistema e mostra a senha para você digitar.
 
